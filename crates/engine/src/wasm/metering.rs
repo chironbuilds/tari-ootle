@@ -20,15 +20,36 @@
 //   WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use wasmer::{sys::ModuleMiddleware, wasmparser::Operator};
-use wasmer_middlewares::Metering;
+use tari_wasmer_middlewares::Metering;
+use wasmer::wasmparser::Operator;
 
-pub fn middleware(limit: u64) -> impl ModuleMiddleware {
-    Metering::new(limit, cost_function)
+/// The static per-operator cost table, as a function pointer so that the concrete `Metering` type
+/// can be named. [`super::bulk_metering::BulkMetering`] holds the same instance to read its global
+/// indexes.
+pub type CostFunction = fn(&Operator) -> u64;
+
+pub fn middleware(limit: u64) -> Metering<CostFunction> {
+    Metering::new(limit, cost_function as CostFunction)
 }
+
+/// Static cost of an operator that [`super::bulk_metering`] also charges by length.
+///
+/// It covers two things the length charge does not. The first is the operator's own dispatch, which
+/// the table below prices at 2 to 4 for these. The second is the charge sequence itself: those
+/// operators are emitted after this middleware has run, which is what keeps them out of the
+/// accumulator, so the ~16 points they execute — three global stores, an extend, a multiply, a
+/// compare, a conditional block, a subtract, and for `grow` a clamp — have to be paid for here.
+/// Without it a module could run the sequence for free by repeating a zero-length copy.
+const BULK_OPERATOR_COST: u64 = 20;
 
 #[allow(clippy::too_many_lines)]
 fn cost_function(op: &Operator) -> u64 {
+    // Asking `bulk_metering` rather than naming the operators again keeps the two halves of the
+    // charge over one set of operators.
+    if super::bulk_metering::charge_for(op).is_some() {
+        return BULK_OPERATOR_COST;
+    }
+
     match op {
         Operator::LocalGet { .. } | Operator::I32Const { .. } => 1,
         Operator::I32Add { .. } => 1,
