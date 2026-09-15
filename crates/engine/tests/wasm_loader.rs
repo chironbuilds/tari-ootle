@@ -554,3 +554,154 @@ fn a_zero_length_copy_pays_for_the_charge_sequence() {
         "a zero-length copy was charged {marginal} points, less than the sequence it runs"
     );
 }
+
+/// Element segments are written into the instance's tables at every instantiation, just as data
+/// segments are copied into its memory, and the module author chooses how many entries there are.
+/// Charging only the flat instantiation cost would let a table-heavy template buy that work for
+/// nothing.
+#[test]
+fn element_segment_entries_are_charged_per_instantiation() {
+    use tari_engine_types::limits::{PER_TEMPLATE_ELEMENT_ENTRY, instantiation_points};
+
+    const ENTRIES: u64 = 4096;
+
+    let funcrefs = vec!["0"; ENTRIES as usize].join(" ");
+    let code = template_module(&format!(
+        r#"
+        (table {ENTRIES} {ENTRIES} funcref)
+        (func (export "tari_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "tari_free") (param i32))
+        (func (export "Buggy_main") (param i32 i32) (result i32) (i32.const 20))
+        (elem (i32.const 0) func {funcrefs})
+        "#
+    ));
+
+    let shape = match WasmModule::load_template_from_code(&code).expect("module was rejected") {
+        tari_engine::template::LoadedTemplate::Wasm(loaded) => loaded.shape(),
+    };
+
+    assert_eq!(shape.element_segment_entries, ENTRIES);
+    assert!(
+        instantiation_points(&shape) >= ENTRIES * PER_TEMPLATE_ELEMENT_ENTRY,
+        "a {ENTRIES}-entry table was not charged for its entries"
+    );
+}
+
+/// A passive segment is not written into the instance at build time — only a `memory.init` or
+/// `table.init` reaching for it does that, and those are charged where they run. Counting one as
+/// instantiation work would charge the same bytes twice, against a call that may never touch them.
+#[test]
+fn passive_segments_are_not_instantiation_work() {
+    let code = template_module(
+        r#"
+        (table 4 4 funcref)
+        (data "passive bytes that no instantiation copies")
+        (elem func 0 0 0 0)
+        (func (export "tari_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "tari_free") (param i32))
+        (func (export "Buggy_main") (param i32 i32) (result i32) (i32.const 20))
+        "#,
+    );
+
+    let shape = match WasmModule::load_template_from_code(&code).expect("module was rejected") {
+        tari_engine::template::LoadedTemplate::Wasm(loaded) => loaded.shape(),
+    };
+
+    // `template_module` contributes one active data segment of its own; the passive one adds nothing.
+    assert_eq!(shape.data_segment_bytes, 5);
+    assert_eq!(shape.element_segment_entries, 0);
+}
+
+/// Nothing caps how many element segments a module declares, and several may target one table at
+/// overlapping offsets — each is written out in turn at instantiation. The entry count a charge is
+/// taken on is therefore bounded by the binary, not by the table limits.
+#[test]
+fn overlapping_element_segments_each_count() {
+    const SEGMENTS: u64 = 8;
+    const ENTRIES: u64 = 512;
+
+    let funcrefs = vec!["0"; ENTRIES as usize].join(" ");
+    let segments = (0..SEGMENTS)
+        .map(|_| format!("(elem (i32.const 0) func {funcrefs})"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = template_module(&format!(
+        r#"
+        (table {ENTRIES} {ENTRIES} funcref)
+        (func (export "tari_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "tari_free") (param i32))
+        (func (export "Buggy_main") (param i32 i32) (result i32) (i32.const 20))
+        {segments}
+        "#
+    ));
+
+    let shape = match WasmModule::load_template_from_code(&code).expect("module was rejected") {
+        tari_engine::template::LoadedTemplate::Wasm(loaded) => loaded.shape(),
+    };
+
+    // Every segment is counted, even though the table only ever holds `ENTRIES` of them at once.
+    assert_eq!(shape.element_segment_entries, SEGMENTS * ENTRIES);
+}
+
+/// A zero-length active data segment contributes no bytes but is still walked, offset-evaluated and
+/// bounds-checked at every instantiation. Pricing data segments by payload alone would make a
+/// section full of them free, and nothing caps how many a module declares.
+#[test]
+fn empty_data_segments_are_charged_per_segment() {
+    use tari_engine_types::limits::{PER_TEMPLATE_DATA_SEGMENT, instantiation_points};
+
+    const SEGMENTS: u64 = 64;
+
+    let empties = (0..SEGMENTS)
+        .map(|_| r#"(data (i32.const 0) "")"#)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let code = template_module(&format!(
+        r#"
+        {empties}
+        (func (export "tari_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "tari_free") (param i32))
+        (func (export "Buggy_main") (param i32 i32) (result i32) (i32.const 20))
+        "#
+    ));
+
+    let shape = match WasmModule::load_template_from_code(&code).expect("module was rejected") {
+        tari_engine::template::LoadedTemplate::Wasm(loaded) => loaded.shape(),
+    };
+
+    // `template_module` carries one active segment of its own.
+    assert_eq!(shape.data_segment_count, SEGMENTS + 1);
+    assert!(
+        instantiation_points(&shape) >= SEGMENTS * PER_TEMPLATE_DATA_SEGMENT,
+        "{SEGMENTS} empty segments were not charged for"
+    );
+}
+
+/// Tables are allocated and zeroed at every instantiation whether or not an element segment writes
+/// to them, and a module claims that storage in a handful of bytes.
+#[test]
+fn declared_table_capacity_is_charged_without_any_element_segment() {
+    use tari_engine_types::limits::{PER_TEMPLATE_TABLE_SLOT, instantiation_points};
+
+    const SLOTS: u64 = 4096;
+
+    let code = template_module(&format!(
+        r#"
+        (table {SLOTS} {SLOTS} funcref)
+        (func (export "tari_alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "tari_free") (param i32))
+        (func (export "Buggy_main") (param i32 i32) (result i32) (i32.const 20))
+        "#
+    ));
+
+    let shape = match WasmModule::load_template_from_code(&code).expect("module was rejected") {
+        tari_engine::template::LoadedTemplate::Wasm(loaded) => loaded.shape(),
+    };
+
+    assert_eq!(shape.declared_table_slots, SLOTS);
+    assert_eq!(shape.element_segment_entries, 0);
+    assert!(
+        instantiation_points(&shape) >= SLOTS * PER_TEMPLATE_TABLE_SLOT,
+        "a {SLOTS}-slot table was not charged for"
+    );
+}

@@ -22,7 +22,7 @@
 
 use std::{fmt, fmt::Formatter, sync::Arc};
 
-use tari_engine_types::limits;
+use tari_engine_types::limits::{self, ModuleShape};
 use tari_template_abi::{FunctionDef, TEMPLATE_DEF_CUSTOM_SECTION, TemplateDef, Type, WASM_PTR_SIZE};
 use wasmer::{
     Engine,
@@ -36,7 +36,7 @@ use wasmer::{
     WasmPtr,
     imports,
     sys::{BaseTunables, CompilerConfig, Cranelift, CraneliftOptLevel, EngineBuilder},
-    wasmparser::{Parser, Payload},
+    wasmparser::{DataKind, ElementItems, ElementKind, Parser, Payload},
 };
 
 use crate::{
@@ -62,23 +62,41 @@ impl WasmModule {
         Self { code: code.into() }
     }
 
-    pub fn validate_code(code: &[u8]) -> Result<TemplateDef, TemplateLoaderError> {
-        // Admission rule for externally-published templates: reject custom
-        // sections the engine does not consume before paying for the cranelift
-        // compile below. Only the registration path runs this; already-stored
-        // templates (and built-ins) load via `load_template_from_code` without
-        // it.
+    /// Every admission rule a published module must pass that the module bytes alone can answer.
+    ///
+    /// Split out from [`Self::validate_code`] so a publisher can be charged for the compile between
+    /// this and [`Self::compile_prevalidated`]: cranelift is the expensive half, and a module
+    /// refused by a rule here never reaches it, so it must not be billed as though it had.
+    pub fn prevalidate_code(code: &[u8]) -> Result<ModuleShape, TemplateLoaderError> {
+        // Reject custom sections the engine does not consume. Only the registration path runs this;
+        // already-stored templates (and built-ins) load via `load_template_from_code` without it.
         reject_disallowed_custom_sections(code).map_err(WasmExecutionError::from)?;
+        let shape = validate_module_structure(code).map_err(WasmExecutionError::from)?;
+        Ok(shape)
+    }
+
+    /// Compiles a module whose [`Self::prevalidate_code`] pass has already run, so neither of that
+    /// pass's two walks over the binary is repeated.
+    pub fn compile_prevalidated(code: &[u8], shape: ModuleShape) -> Result<TemplateDef, TemplateLoaderError> {
         // TODO: evaluate if there are acceptable cheaper ways to fully validate
-        let loaded = Self::load_template_from_code(code)?;
+        let loaded = Self::compile(code, shape)?;
         Ok(loaded.into_template_def())
     }
 
+    pub fn validate_code(code: &[u8]) -> Result<TemplateDef, TemplateLoaderError> {
+        let shape = Self::prevalidate_code(code)?;
+        Self::compile_prevalidated(code, shape)
+    }
+
     pub fn load_template_from_code(code: &[u8]) -> Result<LoadedTemplate, TemplateLoaderError> {
-        validate_module_structure(code).map_err(WasmExecutionError::from)?;
+        let shape = validate_module_structure(code).map_err(WasmExecutionError::from)?;
+        Self::compile(code, shape)
+    }
+
+    fn compile(code: &[u8], shape: ModuleShape) -> Result<LoadedTemplate, TemplateLoaderError> {
         let engine = Self::create_engine();
         let module = wasmer::Module::new(&engine, code)?;
-        Self::finalize_loaded_module(engine, module, code.len())
+        Self::finalize_loaded_module(engine, module, code.len(), shape)
     }
 
     /// Load a template from a previously serialized wasmer module (see
@@ -106,11 +124,12 @@ impl WasmModule {
     pub unsafe fn load_template_from_serialized(
         serialized: bytes::Bytes,
         code_size: usize,
+        shape: ModuleShape,
     ) -> Result<LoadedTemplate, TemplateLoaderError> {
         let engine = Self::create_engine();
         // SAFETY: forwarded to caller — see function-level docs.
         let module = unsafe { wasmer::Module::deserialize_unchecked(&engine, serialized) }?;
-        Self::finalize_loaded_module(engine, module, code_size)
+        Self::finalize_loaded_module(engine, module, code_size, shape)
     }
 
     /// Validates a compiled module and turns it into a [`LoadedTemplate`].
@@ -122,6 +141,7 @@ impl WasmModule {
         engine: Engine,
         module: wasmer::Module,
         code_size: usize,
+        shape: ModuleShape,
     ) -> Result<LoadedTemplate, TemplateLoaderError> {
         let template = load_template_def_from_custom_section(&module)?;
         let main_fn = format!("{}_main", template.template_name());
@@ -146,7 +166,7 @@ impl WasmModule {
 
         let engine = store.engine().clone();
 
-        Ok(LoadedWasmTemplate::new(template, module, engine, code_size).into())
+        Ok(LoadedWasmTemplate::new(template, module, engine, code_size, shape).into())
     }
 
     pub fn code(&self) -> &[u8] {
@@ -211,15 +231,23 @@ pub struct LoadedWasmTemplate {
     module: wasmer::Module,
     engine: Engine,
     code_size: usize,
+    shape: ModuleShape,
 }
 
 impl LoadedWasmTemplate {
-    pub fn new(template_def: TemplateDef, module: wasmer::Module, engine: Engine, code_size: usize) -> Self {
+    pub fn new(
+        template_def: TemplateDef,
+        module: wasmer::Module,
+        engine: Engine,
+        code_size: usize,
+        shape: ModuleShape,
+    ) -> Self {
         Self {
             template_def: Arc::new(template_def),
             module,
             engine,
             code_size,
+            shape,
         }
     }
 
@@ -253,6 +281,10 @@ impl LoadedWasmTemplate {
 
     pub fn code_size(&self) -> usize {
         self.code_size
+    }
+
+    pub fn shape(&self) -> ModuleShape {
+        self.shape
     }
 }
 
@@ -423,7 +455,8 @@ fn validate_export_signature(
 /// declaration far smaller than what it claims. Each table's element count is bounded by the
 /// tunables, which see one table at a time, so the number of tables is what bounds the storage all
 /// of them together claim; a global's slot is fixed, so its count is the whole bound.
-fn validate_module_structure(code: &[u8]) -> Result<(), WasmValidationError> {
+fn validate_module_structure(code: &[u8]) -> Result<ModuleShape, WasmValidationError> {
+    let mut shape = ModuleShape::default();
     for payload in Parser::new(0).parse_all(code) {
         // Malformed wasm: stop and let the cranelift compile in
         // `load_template_from_code` report the canonical CompileError.
@@ -438,6 +471,9 @@ fn validate_module_structure(code: &[u8]) -> Result<(), WasmValidationError> {
                         max_tables: limits::WASM_LIMITS.max_tables,
                     });
                 }
+                for table in reader.into_iter().flatten() {
+                    shape.declared_table_slots = shape.declared_table_slots.saturating_add(table.ty.initial);
+                }
             },
             Payload::GlobalSection(reader) => {
                 let count = reader.count() as usize;
@@ -448,10 +484,34 @@ fn validate_module_structure(code: &[u8]) -> Result<(), WasmValidationError> {
                     });
                 }
             },
+            // Only active segments are written into the instance's storage when it is built. A
+            // passive segment stays in the module until a `memory.init` or `table.init` reaches for
+            // it, so its bytes are a cost of that operator rather than of instantiation, and a call
+            // that never executes one must not pay for it.
+            Payload::DataSection(reader) => {
+                for segment in reader.into_iter().flatten() {
+                    if matches!(segment.kind, DataKind::Active { .. }) {
+                        shape.data_segment_bytes = shape.data_segment_bytes.saturating_add(segment.data.len() as u64);
+                        shape.data_segment_count = shape.data_segment_count.saturating_add(1);
+                    }
+                }
+            },
+            Payload::ElementSection(reader) => {
+                for segment in reader.into_iter().flatten() {
+                    if !matches!(segment.kind, ElementKind::Active { .. }) {
+                        continue;
+                    }
+                    let entries = match segment.items {
+                        ElementItems::Functions(items) => u64::from(items.count()),
+                        ElementItems::Expressions(_, items) => u64::from(items.count()),
+                    };
+                    shape.element_segment_entries = shape.element_segment_entries.saturating_add(entries);
+                }
+            },
             _ => {},
         }
     }
-    Ok(())
+    Ok(shape)
 }
 
 fn validate_functions(template_def: &TemplateDef) -> Result<(), WasmExecutionError> {

@@ -25,7 +25,7 @@ use std::{sync::Arc, time::Instant};
 use log::*;
 use ootle_network::Network;
 use tari_engine_types::{
-    commit_result::{ExecuteResult, FinalizeResult, RejectReason},
+    commit_result::{ExecuteResult, FinalizeResult},
     component::{Component, derive_component_address_from_public_key},
     entity_id_provider::EntityIdProvider,
     fees::ExhaustBurnRate,
@@ -200,32 +200,6 @@ where
                 })?;
 
         let instructions = executable.into_instructions();
-
-        // A transaction may publish at most one template. Enforced here during execution — a consensus rule every
-        // validator applies deterministically — so it holds even for transactions that reach execution without
-        // passing the mempool ingress validator that mirrors it.
-        let publish_template_count = instructions
-            .fee
-            .iter()
-            .chain(&instructions.main)
-            .filter(|instruction| matches!(instruction, Instruction::PublishTemplate { .. }))
-            .count();
-        if publish_template_count > limits::MAX_PUBLISH_TEMPLATES_PER_TRANSACTION {
-            return Ok(ExecuteResult {
-                finalize: FinalizeResult::new_rejected(
-                    id.as_hash(),
-                    RejectReason::ExecutionFailure(format!(
-                        "Transaction contains {publish_template_count} publish-template instructions, but the maximum \
-                         allowed is {}",
-                        limits::MAX_PUBLISH_TEMPLATES_PER_TRANSACTION
-                    )),
-                ),
-                execution_time: timer.elapsed(),
-                execute_epoch: execute_epoch.map(Into::into),
-                wasm_execution_points: 0,
-                native_execution_points: 0,
-            });
-        }
 
         let blobs = std::rc::Rc::new(instructions.blobs);
 
@@ -672,8 +646,15 @@ where
             });
         }
 
-        // validate binary
-        let template_def = WasmModule::validate_code(binary)?;
+        // Every admission rule the module bytes alone can answer runs first, so a module refused by
+        // one of them is not billed for a compile nothing performed.
+        let shape = WasmModule::prevalidate_code(binary)?;
+
+        // The compile is the most expensive thing a single instruction can ask of a validator, so it
+        // is paid for before it runs. The size cap above is what keeps this charge affordable.
+        runtime.interface_mut().charge_template_compile(binary.len() as u64)?;
+
+        let template_def = WasmModule::compile_prevalidated(binary, shape)?;
         // The size cap above is enforced; constructing TemplateBlob is therefore infallible.
         let blob = TemplateBlob::new_checked(binary).expect("template binary size verified above");
         runtime
@@ -966,12 +947,15 @@ where
 
     fn invoke_template(
         module: LoadedTemplate,
-        runtime: Runtime,
+        mut runtime: Runtime,
         function_def: &FunctionDef,
         args: &[tari_bor::Value],
     ) -> Result<InstructionResult, TransactionErrorKind> {
         let result = match module {
             LoadedTemplate::Wasm(loaded) => {
+                // Instantiation runs before the first metered operator, so it is charged against
+                // the same allowance and per-block budget the call's execution draws on.
+                runtime.interface_mut().charge_template_instantiation(&loaded.shape())?;
                 let mut store = loaded.create_store();
                 let mut process = WasmProcess::init(&mut store, loaded, runtime)?;
                 process.invoke(&mut store, function_def, args)?

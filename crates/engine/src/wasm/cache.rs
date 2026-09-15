@@ -30,7 +30,7 @@ use std::{
 
 use log::*;
 use memmap2::Mmap;
-use tari_engine_types::published_template::PublishedTemplate;
+use tari_engine_types::{limits::ModuleShape, published_template::PublishedTemplate};
 use tari_ootle_common_types::{
     Epoch,
     services::template_provider::{TemplateMetadataProvider, TemplateProvider, TemplateProviderMetadata},
@@ -57,20 +57,27 @@ const LOG_TARGET: &str = "tari::engine::wasm::cache";
 ///   so a node serving a stale artifact meters against the old cap and diverges from one that compiled fresh.
 /// - The `wasmer` crate version (the serialized artifact format is internal to wasmer and not part of any stable wire
 ///   spec).
+/// - The layout of the file's own header (`HEADER_BYTES` and the fields it carries). A reader that disagrees with the
+///   writer about the header slices the artifact at the wrong offset and reads the fields from the wrong bytes.
+/// - How the header's values are derived — `validate_module_structure`'s segment tally. A cache hit serves these
+///   verbatim rather than recomputing them, and `instantiation_points` prices a call off them, so a node reading a file
+///   written under an older derivation charges a different fee for the same transaction than one that compiled fresh.
+///   These are consensus values, not accounting hints.
 ///
 /// On a bump, old cache files become orphans (different filename suffix)
 /// and the next compile-from-source rewrites under the new key.
-pub const ENGINE_FINGERPRINT: &str = "v6";
+pub const ENGINE_FINGERPRINT: &str = "v5";
 
-/// 8-byte LE length prefix at the head of each cache file holding the original
-/// WASM source byte count. `wasmer::Module::serialize` doesn't preserve this
-/// and downstream consumers use it for accounting (e.g. moka weighing).
-const HEADER_BYTES: usize = 8;
+/// Five 8-byte LE fields at the head of each cache file: the original WASM source byte count
+/// followed by the four counts of [`ModuleShape`]. `wasmer::Module::serialize` preserves none of
+/// them, and all are needed after a cache hit — the first for accounting (e.g. moka weighing), the
+/// rest to price instantiation.
+const HEADER_BYTES: usize = 40;
 
 /// Low-level on-disk cache for compiled wasmer modules.
 ///
 /// Files live at `{dir}/{template_address}_{ENGINE_FINGERPRINT}.bin`.
-/// The body is `[u64 LE: code_size] || wasmer::Module::serialize(...)`.
+/// The body is `[u64 LE: code_size][u64 LE x4: ModuleShape] || wasmer::Module::serialize(...)`.
 ///
 /// Writes are atomic (tempfile + rename). Read failures (missing file,
 /// deserialize errors, format changes) are non-fatal: the corrupt file is
@@ -151,12 +158,21 @@ impl WasmModuleCache {
             return None;
         }
 
-        let mut header = [0u8; HEADER_BYTES];
-        header.copy_from_slice(&mmap[..HEADER_BYTES]);
-        let code_size = u64::from_le_bytes(header) as usize;
+        let mut field = [0u8; 8];
+        let mut read_field = |i: usize| {
+            field.copy_from_slice(&mmap[i * 8..(i + 1) * 8]);
+            u64::from_le_bytes(field)
+        };
+        let code_size = read_field(0) as usize;
+        let shape = ModuleShape {
+            data_segment_bytes: read_field(1),
+            data_segment_count: read_field(2),
+            element_segment_entries: read_field(3),
+            declared_table_slots: read_field(4),
+        };
 
         // Wrap the mmap as a Bytes that owns it, then slice past the
-        // 8-byte header. `Bytes::slice` is zero-copy (pointer + length
+        // header. `Bytes::slice` is zero-copy (pointer + length
         // adjustment); the wrapped Mmap is dropped only when the resulting
         // Bytes (and any clones the deserializer may keep) goes out of
         // scope.
@@ -169,7 +185,7 @@ impl WasmModuleCache {
         // fingerprint suffix in the filename guarantees the engine config
         // matches this build; a deserialize failure simply triggers the
         // recompile fallback.
-        match unsafe { WasmModule::load_template_from_serialized(body, code_size) } {
+        match unsafe { WasmModule::load_template_from_serialized(body, code_size, shape) } {
             Ok(loaded) => {
                 debug!(target: LOG_TARGET, "Cache hit for template {}", addr);
                 Some(loaded)
@@ -210,6 +226,11 @@ impl WasmModuleCache {
 
         let mut bytes = Vec::with_capacity(HEADER_BYTES + serialized.len());
         bytes.extend_from_slice(&(wasm.code_size() as u64).to_le_bytes());
+        let shape = wasm.shape();
+        bytes.extend_from_slice(&shape.data_segment_bytes.to_le_bytes());
+        bytes.extend_from_slice(&shape.data_segment_count.to_le_bytes());
+        bytes.extend_from_slice(&shape.element_segment_entries.to_le_bytes());
+        bytes.extend_from_slice(&shape.declared_table_slots.to_le_bytes());
         bytes.extend_from_slice(&serialized);
 
         if let Err(e) = fs::write(&tmp, &bytes) {

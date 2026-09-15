@@ -124,3 +124,89 @@ fn merge_remaps_publish_template_blob_index() {
         metadata_hash: None,
     });
 }
+
+/// The fee builder indexes its blobs from zero, independently of the main builder's. Carrying its
+/// instructions across without its blobs leaves them pointing at whatever happens to sit at that
+/// index in the main list, or at nothing at all.
+#[test]
+fn fee_instruction_blobs_are_carried_over_and_remapped() {
+    let tx = Transaction::builder_localnet(Epoch(1))
+        .add_blob("main", vec![0u8; 4])
+        .with_fee_instructions_builder(|builder| builder.publish_template(vec![9u8, 9, 9]))
+        .build_unsigned();
+
+    let blobs = tx.blobs();
+    assert_eq!(blobs.len(), 2, "the fee builder's blob was dropped");
+    assert_eq!(blobs.get(0).unwrap().as_bytes(), &[0u8; 4][..]);
+    assert_eq!(blobs.get(1).unwrap().as_bytes(), &[9u8, 9, 9]);
+
+    assert_eq!(tx.fee_instructions()[0], Instruction::PublishTemplate {
+        binary: 1,
+        metadata_hash: None,
+    });
+}
+
+/// A blob referenced only from a fee instruction still has to resolve.
+#[test]
+fn a_fee_instruction_blob_resolves_when_nothing_else_carries_one() {
+    let tx = Transaction::builder_localnet(Epoch(1))
+        .with_fee_instructions_builder(|builder| builder.publish_template(vec![4u8, 5, 6]))
+        .build_unsigned();
+
+    assert_eq!(tx.blobs().len(), 1);
+    assert_eq!(tx.fee_instructions()[0], Instruction::PublishTemplate {
+        binary: 0,
+        metadata_hash: None,
+    });
+}
+
+/// A transaction may carry `BlobIndex::MAX + 1` blobs, so the count itself does not fit a
+/// `BlobIndex`. Building one with a full blob list must still work when the fee builder adds none.
+#[test]
+fn a_full_blob_list_builds_when_the_fee_builder_carries_none() {
+    let mut builder = Transaction::builder_localnet(Epoch(1));
+    for i in 0..=u8::MAX {
+        builder = builder.add_blob(format!("b{i}"), vec![i]);
+    }
+
+    let tx = builder
+        .with_fee_instructions_builder(|b| b.add_instruction(Instruction::DropAllProofsInWorkspace))
+        .build_unsigned();
+
+    assert_eq!(tx.blobs().len(), u8::MAX as usize + 1);
+}
+
+/// Fee and main blobs share one `BlobIndex` range, so the sum is what a new blob has to fit. A
+/// caller filling both halves through the fallible API must be told which addition does not fit,
+/// whichever half it is on and whichever order the halves are built in — `finish` is infallible and
+/// has nowhere to report it.
+#[test]
+fn the_fallible_api_refuses_the_blob_that_does_not_fit() {
+    // Main filled first: the fee builder's addition is the one refused.
+    let mut builder = Transaction::builder_localnet(Epoch(1));
+    for i in 0..=u8::MAX {
+        builder = builder.add_blob(format!("b{i}"), vec![i]);
+    }
+    let mut refused_on_fee = false;
+    let builder = builder.with_fee_instructions_builder(|b| {
+        // `add_blob_checked` consumes the builder, so probe with a clone to keep it on refusal.
+        match b.clone().add_blob_checked("fee", vec![1]) {
+            Ok(b) => b,
+            Err(_) => {
+                refused_on_fee = true;
+                b
+            },
+        }
+    });
+    assert!(refused_on_fee, "a 257th blob on the fee builder must be refused");
+    assert_eq!(builder.build_unsigned().blobs().len(), u8::MAX as usize + 1);
+
+    // Fee builder filled first: the main builder's addition is the one refused.
+    let builder = Transaction::builder_localnet(Epoch(1)).with_fee_instructions_builder(|mut b| {
+        for i in 0..=u8::MAX {
+            b = b.add_blob(format!("f{i}"), vec![i]);
+        }
+        b
+    });
+    assert!(builder.add_blob_checked("main", vec![0]).is_err());
+}

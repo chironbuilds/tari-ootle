@@ -337,12 +337,11 @@ fn calc_instruction_weight(instruction: &Instruction) -> u64 {
             access_rules,
             bucket_workspace_id: workspace_id,
             ..
-        } => {
-            access_rules.as_ref().map(|a| a.num_access_rules() as u64).unwrap_or(0) +
-                workspace_id.as_ref().map(|_| 1).unwrap_or(0)
-        },
-        Instruction::CallFunction { args, .. } => calc_args_weight(args),
-        Instruction::CallMethod { args, .. } => calc_args_weight(args),
+        } => (access_rules.as_ref().map(|a| a.num_access_rules() as u64).unwrap_or(0) +
+            workspace_id.as_ref().map(|_| 1).unwrap_or(0))
+        .max(INVOCATION_FLOOR),
+        Instruction::CallFunction { args, .. } => calc_args_weight(args).max(INVOCATION_FLOOR),
+        Instruction::CallMethod { args, .. } => calc_args_weight(args).max(INVOCATION_FLOOR),
         Instruction::PutLastInstructionOutputOnWorkspace { .. } => 0, // Call already costs
         Instruction::ClaimBurn { .. } => CLAIM_FIXED_COST,
         Instruction::ClaimValidatorFees { .. } => 1,
@@ -357,7 +356,7 @@ fn calc_instruction_weight(instruction: &Instruction) -> u64 {
         Instruction::StealthTransfer { statement, .. } => calc_stealth_statement_weight(statement),
         Instruction::PayFeeFromBucket { .. } => 1,
         Instruction::UpdateComponentTemplate { migrate, .. } => {
-            1 + migrate.as_ref().map(|m| calc_args_weight(&m.args)).unwrap_or(0)
+            (1 + migrate.as_ref().map(|m| calc_args_weight(&m.args)).unwrap_or(0)).max(INVOCATION_FLOOR)
         },
     }
 }
@@ -399,6 +398,25 @@ fn calc_stealth_statement_weight(statement: &StealthTransferStatement) -> u64 {
 /// Public because the dry-run fee allowance is derived from it: the encoded width of the `max_fee`
 /// literal is the one term that can make a real run weigh more than the dry run that estimated it.
 pub const LITERAL_BYTE_DIVISOR: u64 = 3;
+
+/// Least weight a template invocation may carry, whatever its arguments come to.
+///
+/// A call with no arguments weighs nothing by argument alone, so without a floor
+/// `max_transaction_weight` bounds a transaction's bytes but not the number of invocations it
+/// packs — and every invocation instantiates the template afresh
+/// ([`tari_engine_types::limits::instantiation_points`]), which is real work before any of the
+/// template's own code runs. The execution-point budget is what prices that work; this floor is
+/// what keeps the weight cap a bound on instruction count at all.
+pub const INVOCATION_FLOOR: u64 = 30;
+
+/// Smallest number of encoded bytes an instruction that invokes a template can occupy — a
+/// `CallMethod` naming its component by workspace slot rather than by address, which is the whole
+/// instruction in ten bytes. One `PutLastInstructionOutputOnWorkspace` followed by a run of these
+/// is a valid transaction, and every one of them instantiates a template.
+///
+/// Paired with [`INVOCATION_FLOOR`], this is what turns the transaction byte cap into a bound on
+/// invocation count. `no_invocation_encodes_smaller_than_the_recorded_minimum` keeps it honest.
+pub const MIN_INVOCATION_ENCODED_BYTES: usize = 10;
 
 fn calc_args_weight(args: &[InstructionArg]) -> u64 {
     // Workspace and blob refs are cheap — just an index. Blob payloads are charged at the
@@ -723,5 +741,89 @@ mod transaction_id_tests {
         );
 
         assert_ne!(a.calculate_id(), b.calculate_id());
+    }
+}
+
+#[cfg(test)]
+mod weight_tests {
+    use tari_template_lib_types::{FunctionName, ObjectKey, TemplateAddress};
+
+    use super::*;
+    use crate::MigrateFunction;
+
+    /// The smallest invocation there is: the component comes from a workspace slot, so the
+    /// instruction carries no address at all.
+    fn workspace_call() -> Instruction {
+        Instruction::CallMethod {
+            call: crate::ComponentReference::Workspace(0),
+            method: FunctionName::try_from("m").expect("a one-character method name fits"),
+            args: vec![],
+        }
+    }
+
+    fn no_arg_call() -> Instruction {
+        Instruction::CallMethod {
+            call: ComponentAddress::new(ObjectKey::default()).into(),
+            method: FunctionName::try_from("m").expect("a one-character method name fits"),
+            args: vec![],
+        }
+    }
+
+    /// The permissionless shape: no owner rule, no access rules, no bucket. It still reaches
+    /// `invoke_template` in the processor, so it is an invocation like any other.
+    fn bare_create_account() -> Instruction {
+        Instruction::CreateAccount {
+            owner_public_key: tari_template_lib_types::crypto::RistrettoPublicKeyBytes::zero(),
+            owner_rule: None,
+            access_rules: None,
+            bucket_workspace_id: None,
+        }
+    }
+
+    /// A migration whose function takes no arguments: it still pushes a call frame and instantiates
+    /// the target template.
+    fn bare_template_update() -> Instruction {
+        Instruction::UpdateComponentTemplate {
+            component: ComponentAddress::new(ObjectKey::default()).into(),
+            new_template: TemplateAddress::default(),
+            migrate: Some(MigrateFunction {
+                name: FunctionName::try_from("m").expect("a one-character function name fits"),
+                args: vec![],
+            }),
+        }
+    }
+
+    /// An instruction carrying no arguments weighs nothing by argument alone, so the floor is what
+    /// stops a list of them from being free. Every instruction that reaches `invoke_template` in the
+    /// processor must carry it.
+    #[test]
+    fn every_instruction_that_invokes_a_template_weighs_the_floor() {
+        assert_eq!(calc_instruction_weight(&workspace_call()), INVOCATION_FLOOR);
+        assert_eq!(calc_instruction_weight(&no_arg_call()), INVOCATION_FLOOR);
+        assert_eq!(calc_instruction_weight(&bare_create_account()), INVOCATION_FLOOR);
+        assert_eq!(calc_instruction_weight(&bare_template_update()), INVOCATION_FLOOR);
+    }
+
+    /// `consensus_constants::the_weight_cap_bounds_the_instructions_the_size_cap_admits` reads this
+    /// back to check the floor against the byte cap, which lives in a crate downstream of this one,
+    /// so it has to be the smallest encoding of any instruction that invokes a template.
+    #[test]
+    fn no_invocation_encodes_smaller_than_the_recorded_minimum() {
+        for instruction in [
+            workspace_call(),
+            no_arg_call(),
+            bare_create_account(),
+            bare_template_update(),
+        ] {
+            let encoded = tari_bor::encode(&instruction).unwrap().len();
+            assert!(
+                encoded >= MIN_INVOCATION_ENCODED_BYTES,
+                "{instruction:?} encodes to {encoded} bytes"
+            );
+        }
+        assert_eq!(
+            tari_bor::encode(&workspace_call()).unwrap().len(),
+            MIN_INVOCATION_ENCODED_BYTES
+        );
     }
 }

@@ -41,6 +41,7 @@ use tari_engine_types::{
     indexed_value::{IndexedValue, IndexedWellKnownTypes},
     instruction_result::InstructionResult,
     limits,
+    limits::ModuleShape,
     lock::LockFlag,
     logs::LogEntry,
     proof::{ContainerRef, LockedResource},
@@ -4155,6 +4156,16 @@ where
             module.on_wasm_execution(&mut self.tracker, points_consumed)?;
         }
         Ok(())
+    }
+
+    fn charge_template_instantiation(&mut self, shape: &ModuleShape) -> Result<(), RuntimeError> {
+        self.tracker
+            .charge_native_execution(tari_engine_types::limits::instantiation_points(shape))
+    }
+
+    fn charge_template_compile(&mut self, binary_bytes: u64) -> Result<(), RuntimeError> {
+        self.tracker
+            .charge_native_execution(tari_engine_types::limits::template_compile_points(binary_bytes))
     }
 
     fn wasm_points_consumed(&self) -> u64 {
