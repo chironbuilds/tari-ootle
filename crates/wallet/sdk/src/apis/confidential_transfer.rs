@@ -386,7 +386,10 @@ where TSpec: WalletSdkSpec
                 inputs_to_spend.revealed, params.amount
             )
         });
-        let change_confidential_amount = inputs_to_spend.total_confidential_amount() - remaining_left_to_pay;
+        let change_confidential_amount = inputs_to_spend
+            .total_confidential_amount()
+            .checked_sub(remaining_left_to_pay)
+            .ok_or(ConfidentialTransferApiError::InsufficientFunds)?;
 
         let maybe_change_statement = if change_confidential_amount.is_positive() {
             let statement = self.create_confidential_proof_statement(
