@@ -20,8 +20,6 @@ use crate::{
     v1::{signature::TransactionSignature, transaction::TransactionV1, unsigned::UnsignedTransactionV1},
 };
 
-const LOG_TARGET: &str = "tari::ootle::transaction::transaction";
-
 #[derive(Debug, Clone, borsh::BorshSerialize, minicbor::Encode, minicbor::Decode, minicbor::CborLen)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
@@ -114,14 +112,7 @@ impl UnsealedTransactionV1 {
         // deriving it hashes the whole body including a commitment over every blob's bytes.
         let message =
             TransactionSignature::create_message_v1_with_blob_hashes(seal_signer, &self.transaction, blob_hashes);
-        self.signatures().iter().enumerate().all(|(i, sig)| {
-            if sig.verify_message(message) {
-                true
-            } else {
-                log::debug!(target: LOG_TARGET, "Failed to verify signature at index {}", i);
-                false
-            }
-        })
+        TransactionSignature::verify_all_against_message(self.signatures(), message)
     }
 
     pub fn inputs(&self) -> &IndexSet<SubstateRequirement> {
