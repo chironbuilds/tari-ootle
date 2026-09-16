@@ -34,6 +34,7 @@ use tari_engine::{
 };
 use tari_engine_types::{
     commit_result::{ExecuteResult, RejectReason},
+    fees::ExhaustBurnRate,
     substate::{SubstateDiff, SubstateId},
     virtual_substate::{VirtualSubstate, VirtualSubstateId},
 };
@@ -114,7 +115,7 @@ pub struct TemplateTest {
     enable_fees: bool,
     dry_run: bool,
     fee_table: FeeTable,
-    burn_rate_bps: u16,
+    burn_rate: ExhaustBurnRate,
     virtual_substates: HashMap<VirtualSubstateId, VirtualSubstate>,
     key_seed: u8,
     auto_add_proofs_from_signers: bool,
@@ -226,7 +227,10 @@ impl TemplateTest {
         test
     }
 
-    fn from_package(package: Package) -> Self {
+    /// Builds a harness over a package assembled by the caller. The public constructors compile
+    /// templates from source; this is the seam for a caller that already has loaded templates —
+    /// notably one embedding pre-compiled WASM so it needs no toolchain at run time.
+    pub fn from_package(package: Package) -> Self {
         let secret_key =
             RistrettoSecretKey::from_hex("8a39567509bf2f7074e5fd153337405292cdc9f574947313b62fbf8fb4cffc02").unwrap();
 
@@ -268,7 +272,6 @@ impl TemplateTest {
                 per_transaction_weight_cost: 1,
                 per_module_call_cost: 1,
                 per_byte_storage_cost: 1,
-                per_signature_verification_cost: 1,
                 per_template_load_cost_unit: 1,
                 per_substate_create_cost: 1,
                 per_wasm_point_cost: 1,
@@ -281,7 +284,7 @@ impl TemplateTest {
                 per_template_size_premium_unit_cost: 100,
                 per_template_publish_cost: 250_000,
             },
-            burn_rate_bps: 0,
+            burn_rate: ExhaustBurnRate::new(0),
             key_seed: 1,
             auto_add_proofs_from_signers: true,
         }
@@ -374,7 +377,7 @@ impl TemplateTest {
     /// Sets the exhaust burn rate applied to the transaction's accrued fees. Defaults to zero, so
     /// tests see no burn unless they ask for one.
     pub fn set_burn_rate_bps(&mut self, rate_bps: u16) -> &mut Self {
-        self.burn_rate_bps = rate_bps;
+        self.burn_rate = ExhaustBurnRate::new(rate_bps);
         self
     }
 
@@ -707,7 +710,7 @@ impl TemplateTest {
 
     fn next_key_seed(&mut self) -> u8 {
         let seed = self.key_seed;
-        self.key_seed += 1;
+        self.key_seed = seed.checked_add(1).expect("test key seeds exhausted");
         seed
     }
 
@@ -779,7 +782,7 @@ impl TemplateTest {
         }
 
         let auth_params = AuthParams {
-            initial_ownership_proofs: Arc::new(proofs.into_iter().collect()),
+            initial_ownership_proofs: proofs.into_iter().collect(),
         };
 
         let processor = TransactionProcessor::new(
@@ -790,7 +793,7 @@ impl TemplateTest {
             Arc::from(modules.into_boxed_slice()),
             Arc::new(AlwaysPassesProofVerifier),
             wasm_metering_rate,
-            self.burn_rate_bps,
+            self.burn_rate,
             Network::LocalNet,
             self.dry_run,
         );

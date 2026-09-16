@@ -25,9 +25,10 @@ use std::{sync::Arc, time::Instant};
 use log::*;
 use ootle_network::Network;
 use tari_engine_types::{
-    commit_result::{ExecuteResult, FinalizeResult, RejectReason},
+    commit_result::{ExecuteResult, FinalizeResult},
     component::{Component, derive_component_address_from_public_key},
     entity_id_provider::EntityIdProvider,
+    fees::ExhaustBurnRate,
     indexed_value::{IndexedValue, IndexedWellKnownTypes},
     instruction_result::InstructionResult,
     limits,
@@ -103,8 +104,8 @@ pub struct TransactionProcessor<TStore, TTemplateProvider> {
     modules: ModulesCollection<TStore>,
     claim_burn_proof_verifier: Arc<dyn ClaimProofVerifier + Send + Sync + 'static>,
     wasm_metering_rate: WasmMeteringRate,
-    /// The exhaust burn rate in basis points, resolved for the execution epoch and seeded onto the fee state.
-    burn_rate_bps: u16,
+    /// The exhaust burn rate resolved for the execution epoch and seeded onto the fee state.
+    burn_rate: ExhaustBurnRate,
     /// Selects the substate schema version for the execution epoch, which is scheduled per network.
     network: Network,
     dry_run: bool,
@@ -124,7 +125,7 @@ where
         modules: ModulesCollection<TStore>,
         claim_burn_proof_verifier: Arc<dyn ClaimProofVerifier + Send + Sync + 'static>,
         wasm_metering_rate: WasmMeteringRate,
-        burn_rate_bps: u16,
+        burn_rate: ExhaustBurnRate,
         network: Network,
         dry_run: bool,
     ) -> Self {
@@ -136,7 +137,7 @@ where
             modules,
             claim_burn_proof_verifier,
             wasm_metering_rate,
-            burn_rate_bps,
+            burn_rate,
             network,
             dry_run,
         }
@@ -155,7 +156,7 @@ where
             modules,
             claim_burn_proof_verifier,
             wasm_metering_rate,
-            burn_rate_bps,
+            burn_rate,
             network,
             dry_run,
         } = self;
@@ -186,7 +187,7 @@ where
             intent_commitment,
             transaction_weight,
             wasm_metering_rate,
-            burn_rate_bps,
+            burn_rate,
             network,
             dry_run,
         );
@@ -200,33 +201,7 @@ where
 
         let instructions = executable.into_instructions();
 
-        // A transaction may publish at most one template. Enforced here during execution — a consensus rule every
-        // validator applies deterministically — so it holds even for transactions that reach execution without
-        // passing the mempool ingress validator that mirrors it.
-        let publish_template_count = instructions
-            .fee
-            .iter()
-            .chain(&instructions.main)
-            .filter(|instruction| matches!(instruction, Instruction::PublishTemplate { .. }))
-            .count();
-        if publish_template_count > limits::MAX_PUBLISH_TEMPLATES_PER_TRANSACTION {
-            return Ok(ExecuteResult {
-                finalize: FinalizeResult::new_rejected(
-                    id.as_hash(),
-                    RejectReason::ExecutionFailure(format!(
-                        "Transaction contains {publish_template_count} publish-template instructions, but the maximum \
-                         allowed is {}",
-                        limits::MAX_PUBLISH_TEMPLATES_PER_TRANSACTION
-                    )),
-                ),
-                execution_time: timer.elapsed(),
-                execute_epoch: execute_epoch.map(Into::into),
-                wasm_execution_points: 0,
-                native_execution_points: 0,
-            });
-        }
-
-        let blobs = std::sync::Arc::new(instructions.blobs);
+        let blobs = std::rc::Rc::new(instructions.blobs);
 
         let mut runtime_interface = Box::new(RuntimeInterfaceImpl::initialize(
             tracker,
@@ -235,7 +210,7 @@ where
             entity_id_provider,
             modules,
             claim_burn_proof_verifier,
-            std::sync::Arc::clone(&blobs),
+            std::rc::Rc::clone(&blobs),
         )?) as Box<dyn RuntimeInterface>;
 
         let runtime = Runtime::from_mut(&mut runtime_interface);
@@ -556,11 +531,18 @@ where
             (frame, vec![])
         };
 
+        // The migration frame runs with the *target* template as its `current_template`, while the
+        // component being migrated is the caller's. Only the target template's own migration function
+        // executes in this frame, so the template identity is honest — but `template(...)` (and
+        // `direct_caller_template(...)`) would become forgeable if any other code ever ran here.
         runtime.interface_mut().push_call_frame(call_frame)?;
         // This must come after the call frame as that defines the authorization scope
         runtime
             .interface_mut()
             .check_component_ownership(NativeAction::UpdateComponentTemplate.into())?;
+        // A migration with no `migrate` function never reaches `invoke_template`, so this frame's call boundary
+        // ends here.
+        runtime.interface_mut().revoke_boundary_proofs()?;
 
         runtime.interface_mut().update_component_template(new_template)?;
 
@@ -632,7 +614,7 @@ where
         substate_type: AllocatableAddressType,
         workspace_id: WorkspaceId,
     ) -> Result<InstructionResult, TransactionErrorKind> {
-        let entity_id = runtime.interface().next_entity_id()?;
+        let entity_id = runtime.interface_mut().next_entity_id()?;
         let result = runtime
             .interface_mut()
             .allocate_address(substate_type, entity_id, workspace_id)?;
@@ -667,8 +649,15 @@ where
             });
         }
 
-        // validate binary
-        let template_def = WasmModule::validate_code(binary)?;
+        // Every admission rule the module bytes alone can answer runs first, so a module refused by
+        // one of them is not billed for a compile nothing performed.
+        let shape = WasmModule::prevalidate_code(binary)?;
+
+        // The compile is the most expensive thing a single instruction can ask of a validator, so it
+        // is paid for before it runs. The size cap above is what keeps this charge affordable.
+        runtime.interface_mut().charge_template_compile(binary.len() as u64)?;
+
+        let template_def = WasmModule::compile_prevalidated(binary, shape)?;
         // The size cap above is enforced; constructing TemplateBlob is therefore infallible.
         let blob = TemplateBlob::new_checked(binary).expect("template binary size verified above");
         runtime
@@ -695,6 +684,13 @@ where
             .ok_or(TransactionErrorKind::TemplateNotFound {
                 address: ACCOUNT_TEMPLATE_ADDRESS,
             })?;
+
+        // The derived address belongs to `public_key_address`, so anything that departs from the rules that key
+        // would get requires that key's signature. Creating the account on the default rules stays permissionless
+        // so that a sender can deposit to an account that does not exist yet.
+        if owner_rule.is_some() || access_rules.is_some() {
+            runtime.interface().check_signer_badge_in_scope(*public_key_address)?;
+        }
 
         let account_address = derive_component_address_from_public_key(&ACCOUNT_TEMPLATE_ADDRESS, public_key_address);
 
@@ -808,6 +804,13 @@ where
         function: &str,
         args: Vec<InstructionArg>,
     ) -> Result<InstructionResult, TransactionErrorKind> {
+        // An account lives at an address derived from its public key, so which rules a component may be created
+        // there under is that key's decision. `CreateAccount` is the sole route to the constructor and is where
+        // that decision is enforced.
+        if *template_address == ACCOUNT_TEMPLATE_ADDRESS && function == ACCOUNT_CONSTRUCTOR_FUNCTION {
+            return Err(TransactionErrorKind::CannotCallAccountConstructor);
+        }
+
         let template = template_provider
             .get_template(template_address)
             .map_err(|e| TransactionErrorKind::FailedToLoadTemplate {
@@ -843,7 +846,7 @@ where
             template_address: *template_address,
             module_name: template.template_name().to_string(),
             arg_scope,
-            entity_id: runtime.interface().next_entity_id()?,
+            entity_id: runtime.interface_mut().next_entity_id()?,
         };
 
         runtime.interface_mut().push_call_frame(frame)?;
@@ -945,14 +948,23 @@ where
         Ok(result)
     }
 
+    /// Runs a template function in the frame the caller has already pushed. This is the only path from the engine
+    /// into template code, so it is where a frame stops holding the proofs that were in scope for its call
+    /// boundary: whatever the frame's access rule was evaluated against, the code itself acts with its own badges
+    /// and its `Proof` arguments.
     fn invoke_template(
         module: LoadedTemplate,
-        runtime: Runtime,
+        mut runtime: Runtime,
         function_def: &FunctionDef,
         args: &[tari_bor::Value],
     ) -> Result<InstructionResult, TransactionErrorKind> {
+        runtime.interface_mut().revoke_boundary_proofs()?;
+
         let result = match module {
             LoadedTemplate::Wasm(loaded) => {
+                // Instantiation runs before the first metered operator, so it is charged against
+                // the same allowance and per-block budget the call's execution draws on.
+                runtime.interface_mut().charge_template_instantiation(&loaded.shape())?;
                 let mut store = loaded.create_store();
                 let mut process = WasmProcess::init(&mut store, loaded, runtime)?;
                 process.invoke(&mut store, function_def, args)?

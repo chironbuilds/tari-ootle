@@ -14,6 +14,10 @@ mod template {
         vault: Option<Vault>,
         vault_copy: Option<Vault>,
         vault_ref: Option<VaultId>,
+        proof: Option<Proof>,
+        bucket: Option<Bucket>,
+        allocation: Option<ComponentAddressAllocation>,
+        resource_allocation: Option<ResourceAddressAllocation>,
     }
 
     impl Shenanigans {
@@ -38,6 +42,58 @@ mod template {
             let vault = Vault::new_empty(STEALTH_TARI_RESOURCE_ADDRESS);
             Self {
                 vault: Some(vault),
+                ..Default::default()
+            }
+        }
+
+        pub fn mint_bucket() -> Bucket {
+            ResourceBuilder::public_fungible().initial_supply(1000u32)
+        }
+
+        /// Stores the caller's `Proof` in this component's state. The proof is the caller's, so this frame does not
+        /// owe it and the dangling-proof check at pop has nothing to say about it.
+        pub fn keep_proof_in_state(proof: Proof) -> Self {
+            Self {
+                proof: Some(proof),
+                ..Default::default()
+            }
+        }
+
+        /// Stores the caller's `Bucket` in this component's state rather than in a vault. Inherited like the proof
+        /// above, so the dangling-bucket check does not cover it either.
+        pub fn keep_bucket_in_state(bucket: Bucket) -> Self {
+            Self {
+                bucket: Some(bucket),
+                ..Default::default()
+            }
+        }
+
+        /// Empties the caller's bucket into a fresh one and keeps the emptied bucket in state. An empty bucket is
+        /// tolerated at finalize and stays in the frame's scope, so neither the dangling-bucket check nor the
+        /// in-scope check on the new state objects to the id being there.
+        pub fn keep_emptied_bucket_in_state(mut bucket: Bucket) -> Component<Self> {
+            let contents = bucket.take(bucket.amount());
+            Component::new(Self {
+                vault: Some(Vault::from_bucket(contents)),
+                bucket: Some(bucket),
+                ..Default::default()
+            })
+            .with_access_rules(AccessRules::allow_all())
+            .create()
+        }
+
+        /// Keeps an unconsumed resource address allocation in state.
+        pub fn keep_resource_allocation_in_state() -> Self {
+            Self {
+                resource_allocation: Some(CallerContext::allocate_resource_address()),
+                ..Default::default()
+            }
+        }
+
+        /// Stores an unconsumed address allocation in this component's state.
+        pub fn keep_allocation_in_state() -> Self {
+            Self {
+                allocation: Some(CallerContext::allocate_component_address(None)),
                 ..Default::default()
             }
         }
@@ -73,6 +129,19 @@ mod template {
                 vault.withdraw_all()
             };
             ComponentManager::get(dest_component).call("deposit", args![stolen])
+        }
+
+        /// Reaches the account template's constructor through a cross-template call rather than a `CallFunction`
+        /// instruction, claiming the address derived from `victim_badge`'s key under an owner rule of its own.
+        pub fn create_account_for(victim_badge: NonFungibleAddress) -> ComponentAddress {
+            let no_access_rules: Option<AccessRules> = None;
+            let no_bucket: Option<Bucket> = None;
+            TemplateManager::get(BuiltinTemplate::Account.address()).call("create", args![
+                victim_badge,
+                Some(OwnerRule::ByAccessRule(rule!(allow_all))),
+                no_access_rules,
+                no_bucket
+            ])
         }
 
         pub fn with_vault_copy() -> Self {
@@ -146,6 +215,27 @@ mod template {
             let _auth = stolen_proof.authorize();
         }
 
+        /// Proof ids are a transaction-wide counter, so a third party can name one it was never handed.
+        /// Takes the id as a plain integer, not a `ProofId`: a `ProofId` argument is how a proof is handed over, so
+        /// this frame is given nothing and guesses instead.
+        pub fn try_authorize_proof(&self, proof_id: u32) -> Amount {
+            match Proof::from_id(proof_id.into()).try_authorize() {
+                Ok(_access) => Amount::from(1u64),
+                Err(_) => Amount::zero(),
+            }
+        }
+
+        pub fn read_proof_amount(&self, proof_id: u32) -> Amount {
+            Proof::from_id(proof_id.into()).amount()
+        }
+
+        /// Gives up an authorization for `proof_id`, whatever this frame holds. `ProofAccess::drop` is the only
+        /// route to the action and its field is public, so the guard is built by hand here to name an arbitrary id.
+        pub fn drop_authorize_proof(&self, proof_id: u32) -> Amount {
+            drop(tari_template_lib::models::ProofAccess { id: proof_id.into() });
+            Amount::zero()
+        }
+
         pub fn take_from_a_vault(&mut self, vault_id: VaultId, amount: Amount) {
             let mut vault = Vault::for_test(vault_id.into());
             let stolen = vault.withdraw(amount);
@@ -213,6 +303,28 @@ mod template {
             .create()
         }
 
+        pub fn create_vault_proof(&self) -> Proof {
+            self.vault.as_ref().unwrap().create_proof()
+        }
+
+        /// Holds a proof of its own across a call into `other`, which is handed nothing and guesses the id.
+        ///
+        /// Authorizes `proof_id` from this frame first, where the proof is in scope. An out-of-scope id and an id
+        /// with no proof at it are indistinguishable to `other` by design, so a `proof_id` naming nothing would
+        /// otherwise draw the same answer as the attack being tested. Failing here says so in words no rejection
+        /// from `other` produces.
+        pub fn hold_proof_and_call(&self, other: ComponentAddress, method: String, proof_id: u32) -> Amount {
+            let proof = self.vault.as_ref().unwrap().create_proof();
+            assert!(
+                Proof::from_id(proof_id.into()).try_authorize().is_ok(),
+                "proof id {proof_id} is not held by this frame"
+            );
+
+            let result: Amount = ComponentManager::get(other).call(&method, args![proof_id]);
+            proof.drop();
+            result
+        }
+
         pub fn abandon_bucket(&mut self) {
             let _bucket = self.vault.as_mut().unwrap().withdraw(Amount::from(1u64));
         }
@@ -245,6 +357,17 @@ mod template {
 
         pub fn deposit(&mut self, bucket: Bucket) {
             self.vault.as_mut().unwrap().deposit(bucket);
+        }
+
+        /// Joins a bucket whose funds a proof has locked into another. `join` moves only the unlocked funds, so
+        /// the engine must refuse it rather than let the locked portion vanish while the proof still names it.
+        pub fn join_locked_bucket(&mut self) {
+            let locked = self.vault.as_mut().unwrap().withdraw(Amount::from(10u64));
+            let target = self.vault.as_mut().unwrap().withdraw(Amount::from(10u64));
+            let proof = locked.create_proof();
+            let joined = target.join(locked);
+            proof.drop();
+            self.vault.as_mut().unwrap().deposit(joined);
         }
     }
 }

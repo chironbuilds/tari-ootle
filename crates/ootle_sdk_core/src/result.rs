@@ -271,12 +271,11 @@ fn fee_source_name(source: FeeSource) -> &'static str {
         FeeSource::RuntimeCall => "RuntimeCall",
         FeeSource::Storage => "Storage",
         FeeSource::TransactionWeight => "TransactionWeight",
-        FeeSource::SignatureVerification => "SignatureVerification",
         FeeSource::TemplateLoad => "TemplateLoad",
         FeeSource::SubstateCreate => "SubstateCreate",
         FeeSource::WasmExecution => "WasmExecution",
         FeeSource::TemplatePublish => "TemplatePublish",
-        FeeSource::ExhaustBurn => "ExhaustBurn",
+        FeeSource::Reserved => "Reserved",
         FeeSource::NativeExecution => "NativeExecution",
     }
 }

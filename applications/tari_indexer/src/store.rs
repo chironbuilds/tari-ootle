@@ -260,7 +260,10 @@ pub trait IndexerStoreReadTransaction {
     // -------------------------------- Substate Cache -------------------------------- //
 
     /// The cached head version of `substate_id`. Says nothing about whether it is fresh enough to
-    /// serve, nor what it implies for lower versions - see [`crate::substate_cache::SqliteSubstateCache`].
+    /// serve - see [`crate::substate_cache::SqliteSubstateCache`] - nor what it implies for a
+    /// lookup at a particular version, which is
+    /// [`SubstateCacheEntry::answer_at`](tari_indexer_lib::substate_cache::SubstateCacheEntry::answer_at)'s
+    /// to decide.
     fn substate_cache_get(&mut self, substate_id: &SubstateId) -> Result<Option<SubstateCacheEntry>, StorageError>;
 }
 
@@ -359,15 +362,30 @@ pub trait IndexerStoreWriteTransaction {
     /// Must be applied in the same transaction that advances the sync watermark `state_version`
     /// belongs to: an entry is served on the argument that the cache holds every transition up to
     /// that watermark, which a reader observing one without the other would break.
+    ///
+    /// Returns how many cached entries were retired.
     fn substate_cache_invalidate<I: IntoIterator<Item = SubstateCacheInvalidation>>(
         &mut self,
         invalidations: I,
         state_version: StateVersion,
-    ) -> Result<(), StorageError>;
+    ) -> Result<usize, StorageError>;
+
+    /// Like [`substate_cache_invalidate`](Self::substate_cache_invalidate), but for transitions
+    /// learnt of ahead of the stream - from a committee's finalized result - so the journalled
+    /// `StateVersion` is not the transition's own. Each is journalled at its own version: the
+    /// caller passes one just past the shard's watermark, so that every fetch captured before the
+    /// stream delivers the transition is vetoed, and the stream's own journal row replaces it when
+    /// it does.
+    ///
+    /// Returns how many cached entries were retired.
+    fn substate_cache_retire_ahead<I: IntoIterator<Item = (SubstateCacheInvalidation, StateVersion)>>(
+        &mut self,
+        invalidations: I,
+    ) -> Result<usize, StorageError>;
 
     /// Drops journal entries older than `journal_retention` and evicts the oldest cache entries down
-    /// to `max_entries`.
-    fn substate_cache_prune(&mut self, journal_retention: Duration, max_entries: usize) -> Result<(), StorageError>;
+    /// to `max_entries`. Returns how many entries were evicted.
+    fn substate_cache_prune(&mut self, journal_retention: Duration, max_entries: usize) -> Result<usize, StorageError>;
 }
 
 /// The locally recorded rejection state of a transaction.
@@ -403,10 +421,10 @@ pub struct XtrEconomics {
     pub total_claimed: Amount,
     /// Total exhaust burned, sourced from checkpoint headers. Authoritative and complete since genesis.
     pub total_exhaust_burned: Amount,
-    /// Total pre-burn execution fees `F`, summed from transaction receipts.
+    /// Total fees paid by transaction payers, summed from transaction receipts.
     pub fee_volume: Amount,
     /// Total exhaust burned, summed from the same transaction receipts as `fee_volume` (so their ratio is
-    /// the exact realized rate).
+    /// the exact realized burn share).
     pub receipt_exhaust_burned: Amount,
     /// Number of transaction receipts the indexer has stored.
     pub transaction_receipt_count: u64,

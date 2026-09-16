@@ -10,7 +10,7 @@
       "name": "BSD-3-Clause",
       "identifier": "BSD-3-Clause"
     },
-    "version": "0.40.0"
+    "version": "0.41.0"
   },
   "paths": {
     "/epoch-checkpoints": {
@@ -497,7 +497,7 @@
             }
           },
           "503": {
-            "description": "Indexer is still syncing",
+            "description": "Indexer is still syncing, or no committee answers for the substate's shard group",
             "content": {
               "application/json": {
                 "schema": {
@@ -559,7 +559,7 @@
             }
           },
           "404": {
-            "description": "Substate not found",
+            "description": "No such substate, or the version asked for has been spent",
             "content": {
               "application/json": {
                 "schema": {
@@ -579,7 +579,7 @@
             }
           },
           "503": {
-            "description": "Indexer is still syncing",
+            "description": "Indexer is still syncing, or no committee answers for the substate's shard group",
             "content": {
               "application/json": {
                 "schema": {
@@ -910,7 +910,7 @@
             }
           },
           "503": {
-            "description": "All validators failed to process the transaction",
+            "description": "All validators failed to process the transaction, or a shard group it involves has no committee",
             "content": {
               "application/json": {
                 "schema": {
@@ -1001,7 +1001,7 @@
           {
             "name": "resource_address",
             "in": "query",
-            "description": "Filter by resource address (derived from substate_id for std.resource.* events, or from the `resource_address` payload entry for std.vault.deposit / std.vault.withdraw)",
+            "description": "Filter by resource address. Matches only std.resource.* events, which carry the resource as their substate_id. Vault events name no resource: filter those by substate_id (the vault ID)",
             "required": false,
             "schema": {
               "type": "string"
@@ -1552,16 +1552,16 @@
           },
           "fee_volume": {
             "type": "string",
-            "description": "Total pre-burn execution fees `F`, summed from transaction receipts."
+            "description": "Total fees paid by transaction payers, summed from transaction receipts."
           },
           "receipt_exhaust_burned": {
             "type": "string",
-            "description": "Total exhaust burned summed from the same receipts as `fee_volume`; `receipt_exhaust_burned /\nfee_volume` is the exact realized burn rate, and this is the burn netted from `total_supply`. May\ntransiently trail `total_exhaust_burned` while the receipt sync frontier catches up to the checkpoint\nfrontier."
+            "description": "Total exhaust burned summed from the same receipts as `fee_volume`; `receipt_exhaust_burned /\nfee_volume` is the exact realized burn share, and this is the burn netted from `total_supply`. May\ntransiently trail `total_exhaust_burned` while the receipt sync frontier catches up to the checkpoint\nfrontier."
           },
           "target_burn_rate_bps": {
             "type": "integer",
             "format": "int32",
-            "description": "The target exhaust burn rate in basis points in effect at `current_epoch`.",
+            "description": "The share of collected fees burned rather than paid to leaders, in basis points, in effect at `current_epoch`.",
             "minimum": 0
           },
           "total_claimed": {
@@ -2284,6 +2284,7 @@
       "ValidatorConsensusState": {
         "type": "string",
         "enum": [
+          "Initialising",
           "Idle",
           "CheckSync",
           "Syncing",

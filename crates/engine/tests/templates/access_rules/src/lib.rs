@@ -93,6 +93,58 @@ mod access_rules_template {
             .create()
         }
 
+        /// As `with_auth_hook`, but anyone may mint and burn the tokens, so the hook can be exercised on the
+        /// resource actions that take the resource's write lock.
+        pub fn with_mintable_auth_hook(hook: FunctionName) -> Component<AccessRulesTest> {
+            let badges = create_badge_resource(rule!(deny_all));
+
+            let address_alloc = CallerContext::allocate_component_address(None);
+
+            let tokens = ResourceBuilder::public_fungible()
+                .with_authorization_hook(address_alloc.get_address(), hook)
+                .mintable(rule!(allow_all), LOCKED)
+                .burnable(rule!(allow_all), LOCKED)
+                .initial_supply(1000u32);
+
+            Component::new(Self {
+                value: 0,
+                tokens: Vault::from_bucket(tokens),
+                badges: Vault::from_bucket(badges),
+                allowed: true,
+                attack_component: None,
+            })
+            .with_address_allocation(address_alloc)
+            .with_access_rules(ComponentAccessRules::new().default(rule!(allow_all)))
+            .create()
+        }
+
+        /// As `with_auth_hook`, but the hook may be replaced or removed by whoever satisfies `updater`.
+        pub fn with_updatable_auth_hook(
+            allowed: bool,
+            hook: FunctionName,
+            updater: UpdateRule,
+        ) -> Component<AccessRulesTest> {
+            let badges = create_badge_resource(rule!(deny_all));
+
+            let address_alloc = CallerContext::allocate_component_address(None);
+
+            let tokens = ResourceBuilder::public_fungible()
+                .with_authorization_hook(address_alloc.get_address(), hook)
+                .with_authorization_hook_updater(updater)
+                .initial_supply(1000u32);
+
+            Component::new(Self {
+                value: 0,
+                tokens: Vault::from_bucket(tokens),
+                badges: Vault::from_bucket(badges),
+                allowed,
+                attack_component: None,
+            })
+            .with_address_allocation(address_alloc)
+            .with_access_rules(ComponentAccessRules::new().default(rule!(allow_all)))
+            .create()
+        }
+
         pub fn with_auth_hook_attack_component(component_address: ComponentAddress) -> Component<AccessRulesTest> {
             let badges = create_badge_resource(rule!(deny_all));
 
@@ -116,6 +168,33 @@ mod access_rules_template {
             })
             .with_address_allocation(address_alloc)
             .with_access_rules(ComponentAccessRules::new().default(rule!(allow_all)))
+            .create()
+        }
+
+        pub fn with_auth_hook_gated_on_caller(hook_caller: ComponentAddress) -> Component<AccessRulesTest> {
+            let badges = create_badge_resource(rule!(deny_all));
+
+            let address_alloc = CallerContext::allocate_component_address(None);
+
+            let tokens = ResourceBuilder::public_fungible()
+                .with_authorization_hook(address_alloc.get_address(), "caller_gated_hook")
+                .initial_supply(1000u32);
+
+            Component::new(Self {
+                value: 0,
+                tokens: Vault::from_bucket(tokens),
+                badges: Vault::from_bucket(badges),
+                allowed: true,
+                attack_component: None,
+            })
+            .with_address_allocation(address_alloc)
+            .with_owner_rule(OwnerRule::None)
+            .with_access_rules(
+                ComponentAccessRules::new()
+                    .method("caller_gated_hook", rule!(caller_component(hook_caller)))
+                    .method("take_tokens", rule!(allow_all))
+                    .default(rule!(deny_all)),
+            )
             .create()
         }
 
@@ -211,11 +290,30 @@ mod access_rules_template {
 
         /// Custom resource auth hook
         pub fn valid_auth_hook(&self, action: ResourceAuthAction, caller: AuthHookCaller) {
+            assert_eq!(
+                *caller.resource(),
+                self.tokens.resource_address(),
+                "hook invoked for a resource this component does not manage"
+            );
             let state = caller.component_state();
             debug!("Component state {:?}", state);
             if !self.allowed {
                 panic!("Access denied for action {:?}", action);
             }
+        }
+
+        /// Auth hook whose method rule gates on the acting caller. Used to verify that the hook observes the
+        /// acting component (not the hook author) as its caller.
+        ///
+        /// The caller gate alone is never sufficient: any resource may bind this method as its hook, so a
+        /// gated caller acting on a hostile resource still passes the method rule. The hook must check the
+        /// resource itself.
+        pub fn caller_gated_hook(&self, _action: ResourceAuthAction, caller: AuthHookCaller) {
+            assert_eq!(
+                *caller.resource(),
+                self.tokens.resource_address(),
+                "hook invoked for a resource this component does not manage"
+            );
         }
 
         pub fn malicious_auth_hook_set_state(&self, action: ResourceAuthAction, caller: AuthHookCaller) {
@@ -252,7 +350,33 @@ mod access_rules_template {
             ComponentManager::get(self.attack_component.unwrap()).invoke("set", args![123]);
         }
 
-        pub fn invalid_auth_hook1(&mut self, _action: ResourceAuthAction, _caller: AuthHookCaller) {}
+        /// Points the managed resource's hook at `hook` on this component, or removes it when `hook` is None.
+        pub fn set_auth_hook(&self, hook: Option<FunctionName>) {
+            let hook = hook.map(|method| AuthHook::new(CallerContext::current_component_address(), method));
+            ResourceManager::get(self.tokens.resource_address()).set_auth_hook(hook);
+        }
+
+        /// A mutable hook records each invocation in its own state, the one write a hook frame may make.
+        pub fn counting_auth_hook(&mut self, _action: ResourceAuthAction, _caller: AuthHookCaller) {
+            self.value += 1;
+        }
+
+        /// Attempts a state write outside the hook's own component. The hook frame is confined to its own
+        /// component state, so the engine refuses the vault creation.
+        pub fn hook_creates_vault(&self, _action: ResourceAuthAction, _caller: AuthHookCaller) {
+            let _vault = Vault::new_empty(self.tokens.resource_address());
+        }
+
+        /// Reads the resource the hook guards. A resource action that write-locks the resource must release that
+        /// lock across the hook call, or this read is refused.
+        pub fn hook_reads_own_resource(&self, action: ResourceAuthAction, _caller: AuthHookCaller) {
+            let manager = ResourceManager::get(self.tokens.resource_address());
+            assert_eq!(
+                manager.resource_type(),
+                ResourceType::Fungible,
+                "hook read the wrong resource for action {action:?}"
+            );
+        }
 
         pub fn invalid_auth_hook2(&self, _action: String, _caller: AuthHookCaller) {}
 

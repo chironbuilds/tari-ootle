@@ -164,7 +164,7 @@ mod tests {
         transaction_receipt::{FinalizeOutcome, TransactionReceipt},
     };
     use tari_indexer_client::types::TransactionSource;
-    use tari_indexer_lib::substate_cache::{FetchWatermark, SubstateCacheEntryRef};
+    use tari_indexer_lib::substate_cache::{FetchWatermark, SubstateCacheEntry, SubstateCacheEntryRef};
     use tari_ootle_common_types::{Epoch, NodeHeight, ShardGroup, StateVersion};
     use tari_ootle_transaction::{Transaction, TransactionId};
     use tari_validator_node_rpc::client::SubstateResult;
@@ -191,6 +191,139 @@ mod tests {
             block_hash: FixedHash::new([height as u8; 32]),
             state_merkle_root: FixedHash::new([height as u8; 32]),
         }
+    }
+
+    /// One state version covers a whole synced batch, so a shard's UTXOs cluster into version
+    /// groups. These build a shard whose groups straddle the read limit.
+    fn utxo_resource() -> tari_template_lib_types::ResourceAddress {
+        use std::str::FromStr;
+        tari_template_lib_types::ResourceAddress::from_str(
+            "resource_0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap()
+    }
+
+    fn unspent_at(seq: u8, state_version: u64) -> crate::storage_sqlite::models::UtxoUpdateRecord {
+        use tari_engine_types::{UtxoOutput, crypto::OutputBody};
+        use tari_template_lib_types::{
+            EncryptedData,
+            UtxoId,
+            crypto::{RistrettoPublicKeyBytes, UtxoTag},
+            stealth::SpendAuthorization,
+        };
+
+        use crate::storage_sqlite::models::{UtxoUnspent, UtxoUpdateRecord};
+
+        let address = tari_template_lib_types::UtxoAddress::new(utxo_resource(), UtxoId::from_array([seq; 32]));
+        UtxoUpdateRecord::Unspent(Box::new(UtxoUnspent {
+            address,
+            version: 0,
+            shard: tari_ootle_common_types::shard::Shard::from(1u32),
+            state_version: StateVersion::new(state_version),
+            utxo_output: UtxoOutput {
+                output: OutputBody {
+                    public_nonce: RistrettoPublicKeyBytes::from_bytes(&[seq; 32]).unwrap(),
+                    encrypted_data: EncryptedData::empty(),
+                    minimum_value_promise: 0,
+                    viewable_balance: None,
+                },
+                auth: SpendAuthorization::Key(RistrettoPublicKeyBytes::from_bytes(&[seq; 32]).unwrap()),
+                tag: UtxoTag::from(0u32),
+            },
+            is_frozen: false,
+        }))
+    }
+
+    async fn store_with_utxos(groups: &[(u64, u8)]) -> (tempfile::TempDir, SqliteIndexerStore) {
+        let (dir, store) = temp_store().await;
+        let mut seq = 0u8;
+        let mut records = Vec::new();
+        for &(state_version, count) in groups {
+            for _ in 0..count {
+                seq += 1;
+                records.push(unspent_at(seq, state_version));
+            }
+        }
+        store
+            .with_write_tx(move |tx| tx.batch_insert_utxo_updates(Epoch(1), records))
+            .await
+            .unwrap();
+        (dir, store)
+    }
+
+    async fn read_updates(
+        store: &SqliteIndexerStore,
+        from: u64,
+        limit: u32,
+    ) -> tari_indexer_client::types::UtxoStateUpdateSet {
+        store
+            .with_read_tx(move |tx| {
+                tx.utxos_get_updates(
+                    utxo_resource(),
+                    Epoch(0),
+                    tari_ootle_common_types::shard::Shard::from(1u32),
+                    StateVersion::new(from),
+                    false,
+                    limit,
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_read_stops_on_a_version_boundary_not_mid_version() {
+        // Limit 4 falls inside the 3-row group at version 20.
+        let (_dir, store) = store_with_utxos(&[(10, 2), (20, 3), (30, 1)]).await;
+
+        let set = read_updates(&store, 0, 4).await;
+
+        assert!(set.has_more);
+        // Version 20 is held back whole rather than half-served.
+        assert_eq!(set.max_state_version, StateVersion::new(10));
+        assert_eq!(set.updates.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn resuming_from_the_reported_version_loses_no_update() {
+        let (_dir, store) = store_with_utxos(&[(10, 2), (20, 3), (30, 1)]).await;
+
+        let mut seen = 0;
+        let mut cursor = 0;
+        loop {
+            let set = read_updates(&store, cursor, 4).await;
+            seen += set.updates.len();
+            cursor = set.max_state_version.as_u64();
+            if !set.has_more {
+                break;
+            }
+        }
+
+        assert_eq!(seen, 6);
+    }
+
+    #[tokio::test]
+    async fn a_version_wider_than_the_limit_is_served_whole() {
+        // No complete earlier version to stop at, so the limit gives way rather than the read
+        // returning nothing and stranding the cursor.
+        let (_dir, store) = store_with_utxos(&[(10, 5), (20, 1)]).await;
+
+        let set = read_updates(&store, 0, 2).await;
+
+        assert_eq!(set.updates.len(), 5);
+        assert_eq!(set.max_state_version, StateVersion::new(10));
+        assert!(set.has_more);
+    }
+
+    #[tokio::test]
+    async fn a_drained_read_reports_no_more() {
+        let (_dir, store) = store_with_utxos(&[(10, 2), (20, 1)]).await;
+
+        let set = read_updates(&store, 0, 10).await;
+
+        assert!(!set.has_more);
+        assert_eq!(set.updates.len(), 3);
+        assert_eq!(set.max_state_version, StateVersion::new(20));
     }
 
     async fn temp_store() -> (tempfile::TempDir, SqliteIndexerStore) {
@@ -976,7 +1109,7 @@ mod tests {
                 tx.substate_cache_put(
                     &id,
                     SubstateCacheEntryRef {
-                        version,
+                        version: Some(version),
                         substate_result: &result,
                         cached_at,
                         verified,
@@ -993,13 +1126,73 @@ mod tests {
         put_entry(store, id, version, true, now_secs(), watermark).await
     }
 
-    async fn read(store: &SqliteIndexerStore, id: &SubstateId) -> Option<u32> {
+    /// A committee member answering that `version` is live, as against the `Down` every other put
+    /// helper here records.
+    async fn put_up(store: &SqliteIndexerStore, id: &SubstateId, version: u32, watermark: u64) -> bool {
+        use tari_engine_types::{
+            non_fungible::NonFungibleContainer,
+            substate::{Substate, SubstateValue},
+        };
+
+        let result = SubstateResult::Up {
+            substate: Box::new(Substate::new(
+                version,
+                SubstateValue::NonFungible(NonFungibleContainer::no_data()),
+            )),
+        };
         let id = id.clone();
         store
-            .with_read_tx(move |tx| tx.substate_cache_get(&id))
+            .with_write_tx(move |tx| {
+                tx.substate_cache_put(
+                    &id,
+                    SubstateCacheEntryRef {
+                        version: Some(version),
+                        substate_result: &result,
+                        cached_at: now_secs(),
+                        verified: true,
+                    },
+                    FetchWatermark::new(watermark),
+                    HEAD_TTL,
+                )
+            })
             .await
             .unwrap()
-            .map(|entry| entry.version)
+    }
+
+    /// The cached head version. `None` covers both no row at all and a row recording that the
+    /// substate does not exist; use [`read_entry`] where the two must be told apart.
+    async fn read(store: &SqliteIndexerStore, id: &SubstateId) -> Option<u32> {
+        read_entry(store, id).await.and_then(|entry| entry.version)
+    }
+
+    async fn read_entry(store: &SqliteIndexerStore, id: &SubstateId) -> Option<SubstateCacheEntry> {
+        let id = id.clone();
+        store.with_read_tx(move |tx| tx.substate_cache_get(&id)).await.unwrap()
+    }
+
+    /// Records that `id` does not exist, as an unversioned entry.
+    async fn put_nonexistent(store: &SqliteIndexerStore, id: &SubstateId, watermark: u64) -> bool {
+        let id = id.clone();
+        store
+            .with_write_tx(move |tx| {
+                tx.substate_cache_put(
+                    &id,
+                    SubstateCacheEntryRef {
+                        version: None,
+                        substate_result: &SubstateResult::DoesNotExist,
+                        cached_at: now_secs(),
+                        verified: false,
+                    },
+                    FetchWatermark::new(watermark),
+                    HEAD_TTL,
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    fn is_nonexistent(entry: &SubstateCacheEntry) -> bool {
+        entry.version.is_none() && matches!(entry.substate_result, SubstateResult::DoesNotExist)
     }
 
     async fn invalidate(store: &SqliteIndexerStore, invalidation: SubstateCacheInvalidation, at: u64) {
@@ -1009,6 +1202,232 @@ mod tests {
             .unwrap();
     }
 
+    /// The hole the substate version closes: the fetch is not overtaken by the transition - it
+    /// started afterwards - but the member it asked is behind and answers with a version the stream
+    /// has already shown this substate past. The transition deleted the row that would have ranked
+    /// it, so the journal is the only thing left to refuse it.
+    #[tokio::test]
+    async fn a_version_the_stream_has_already_seen_past_is_refused() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+        assert!(put(&store, &id, 6, 100).await);
+
+        invalidate(&store, SubstateCacheInvalidation::created(&id, 7).unwrap(), 105).await;
+        assert!(read(&store, &id).await.is_none());
+
+        // A fetch that began after the creation committed, answered by a member still on v6.
+        assert!(!put(&store, &id, 6, 110).await);
+        assert!(read(&store, &id).await.is_none());
+    }
+
+    /// The version the stream showed is a floor, not a target: the substate can move on, and a fetch
+    /// that catches up with it must still be recorded.
+    #[tokio::test]
+    async fn a_version_at_or_above_the_one_the_stream_saw_is_recorded() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+
+        invalidate(&store, SubstateCacheInvalidation::created(&id, 7).unwrap(), 105).await;
+        assert!(put(&store, &id, 7, 110).await);
+        assert_eq!(read(&store, &id).await, Some(7));
+        assert!(put(&store, &id, 9, 110).await);
+        assert_eq!(read(&store, &id).await, Some(9));
+    }
+
+    /// A destroy shows the version it names as reached just as a creation does, so a member still
+    /// answering below it is refused the same way.
+    #[tokio::test]
+    async fn a_destroy_records_the_version_it_saw() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+
+        invalidate(&store, SubstateCacheInvalidation::destroyed(id.clone(), 7), 105).await;
+        assert!(!put(&store, &id, 6, 110).await);
+        // The destroyed version is itself a legitimate head: it is down, which is what a lookup for
+        // it answers.
+        assert!(put(&store, &id, 7, 110).await);
+    }
+
+    /// A destroy with no successor leaves the version it named as the floor, and that version is
+    /// spent. A member still holding it live offers an `Up` at exactly the floor, which the version
+    /// alone does not refuse.
+    #[tokio::test]
+    async fn a_destroy_with_no_successor_refuses_a_live_head_at_the_version_it_spent() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+
+        invalidate(&store, SubstateCacheInvalidation::destroyed(id.clone(), 7), 105).await;
+        assert!(!put_up(&store, &id, 7, 110).await);
+        assert!(read(&store, &id).await.is_none());
+    }
+
+    /// The other half of the same floor: a lookup for a destroyed version answers `Down`, so that
+    /// result is the substate's legitimate head and is recorded.
+    #[tokio::test]
+    async fn a_destroy_with_no_successor_still_admits_the_down_at_that_version() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+
+        invalidate(&store, SubstateCacheInvalidation::destroyed(id.clone(), 7), 105).await;
+        assert!(put(&store, &id, 7, 110).await);
+        assert_eq!(read(&store, &id).await, Some(7));
+    }
+
+    /// A destroy with a successor is not a spend of the floor: the creation raises it to the version
+    /// that is live, which must be admitted as an `Up`. The two reach the journal in no stated order.
+    #[tokio::test]
+    async fn a_destroy_with_a_successor_admits_the_created_version_live() {
+        for reversed in [false, true] {
+            let (_d, store) = temp_store().await;
+            let id = substate(1);
+            let mut batch = vec![
+                SubstateCacheInvalidation::destroyed(id.clone(), 6),
+                SubstateCacheInvalidation::created(&id, 7).unwrap(),
+            ];
+            if reversed {
+                batch.reverse();
+            }
+            store
+                .with_write_tx(move |tx| tx.substate_cache_invalidate(batch, StateVersion::new(105)))
+                .await
+                .unwrap();
+
+            assert!(!put_up(&store, &id, 6, 110).await);
+            assert!(put_up(&store, &id, 7, 110).await);
+            assert_eq!(read(&store, &id).await, Some(7));
+        }
+    }
+
+    /// A substate created and destroyed within one batch reaches the journal at a single version
+    /// from both sides. The spend is the later of the two whichever order they arrive in, so it
+    /// stands.
+    #[tokio::test]
+    async fn a_version_both_created_and_destroyed_in_one_batch_is_spent() {
+        for reversed in [false, true] {
+            let (_d, store) = temp_store().await;
+            let id = substate(1);
+            let mut batch = vec![
+                SubstateCacheInvalidation::created(&id, 7).unwrap(),
+                SubstateCacheInvalidation::destroyed(id.clone(), 7),
+            ];
+            if reversed {
+                batch.reverse();
+            }
+            store
+                .with_write_tx(move |tx| tx.substate_cache_invalidate(batch, StateVersion::new(105)))
+                .await
+                .unwrap();
+
+            assert!(!put_up(&store, &id, 7, 110).await);
+            assert!(put(&store, &id, 7, 110).await);
+        }
+    }
+
+    /// One transaction downs a version and ups the next, and the two reach the journal in no stated
+    /// order. The floor is the highest version either showed, whichever was journalled last.
+    #[tokio::test]
+    async fn the_floor_is_the_highest_version_a_batch_showed() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+
+        let batch = [
+            SubstateCacheInvalidation::created(&id, 7).unwrap(),
+            SubstateCacheInvalidation::destroyed(id.clone(), 6),
+        ];
+        store
+            .with_write_tx(move |tx| tx.substate_cache_invalidate(batch, StateVersion::new(105)))
+            .await
+            .unwrap();
+
+        assert!(!put(&store, &id, 6, 110).await);
+        assert!(put(&store, &id, 7, 110).await);
+    }
+
+    /// Nonexistence is settled by f + 1 members rather than one, so a single member being behind
+    /// cannot produce it, and the one that follows a destroy is legitimate.
+    #[tokio::test]
+    async fn a_nonexistence_after_a_destroy_is_still_recorded() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+
+        invalidate(&store, SubstateCacheInvalidation::destroyed(id.clone(), 7), 105).await;
+        assert!(put_nonexistent(&store, &id, 110).await);
+        assert!(is_nonexistent(&read_entry(&store, &id).await.unwrap()));
+    }
+
+    /// The point of journalling a first creation: it is the only transition that can retract the
+    /// claim that a substate does not exist.
+    #[tokio::test]
+    async fn a_first_creation_retires_the_nonexistence_it_denies() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+        assert!(put_nonexistent(&store, &id, 100).await);
+        assert!(is_nonexistent(&read_entry(&store, &id).await.unwrap()));
+
+        invalidate(&store, SubstateCacheInvalidation::created(&id, 0).unwrap(), 105).await;
+        assert!(read_entry(&store, &id).await.is_none());
+    }
+
+    /// A creation retires the nonexistence whatever version it lands at, not only the first.
+    #[tokio::test]
+    async fn a_later_creation_also_retires_the_nonexistence() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+        assert!(put_nonexistent(&store, &id, 100).await);
+
+        invalidate(&store, SubstateCacheInvalidation::created(&id, 6).unwrap(), 105).await;
+        assert!(read_entry(&store, &id).await.is_none());
+    }
+
+    /// `DoesNotExist` says the substate has no live version, which a destroy makes more true.
+    #[tokio::test]
+    async fn a_destroy_leaves_a_cached_nonexistence_alone() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+        assert!(put_nonexistent(&store, &id, 100).await);
+
+        invalidate(&store, SubstateCacheInvalidation::destroyed(id.clone(), 6), 105).await;
+        assert!(is_nonexistent(&read_entry(&store, &id).await.unwrap()));
+    }
+
+    /// The race the journal exists to close: the substate is created while the committee fetch that
+    /// answered `DoesNotExist` is still in flight, so the delete runs before there is a row to
+    /// delete and only the journal can stop the write.
+    #[tokio::test]
+    async fn a_creation_landing_mid_fetch_vetoes_the_nonexistence() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+
+        // The fetch captured the watermark at 100; the creation commits at 105 while it is in flight.
+        invalidate(&store, SubstateCacheInvalidation::created(&id, 0).unwrap(), 105).await;
+        assert!(!put_nonexistent(&store, &id, 100).await);
+        assert!(read_entry(&store, &id).await.is_none());
+    }
+
+    /// Nothing would ever retract a nonexistence recorded for a substate no first creation journals,
+    /// so the write is refused rather than left to age out.
+    #[tokio::test]
+    async fn a_nonexistence_is_refused_where_no_transition_would_retract_it() {
+        let (_d, store) = temp_store().await;
+        let receipt: SubstateId = format!("txreceipt_{:064x}", 1).parse().unwrap();
+        assert!(!put_nonexistent(&store, &receipt, 100).await);
+        assert!(read_entry(&store, &receipt).await.is_none());
+    }
+
+    /// Nonexistence ranks below every version: a real head displaces it, and it never walks one back.
+    #[tokio::test]
+    async fn a_nonexistence_yields_to_any_head() {
+        let (_d, store) = temp_store().await;
+        let id = substate(1);
+        assert!(put_nonexistent(&store, &id, 100).await);
+        assert!(put(&store, &id, 0, 100).await);
+        assert_eq!(read(&store, &id).await, Some(0));
+
+        // ...and cannot displace one that is verified and current.
+        assert!(!put_nonexistent(&store, &id, 100).await);
+        assert_eq!(read(&store, &id).await, Some(0));
+    }
+
     #[tokio::test]
     async fn a_cached_head_is_held_until_a_transition_retires_it() {
         let (_d, store) = temp_store().await;
@@ -1016,7 +1435,7 @@ mod tests {
         assert!(put(&store, &id, 5, 100).await);
         assert_eq!(read(&store, &id).await, Some(5));
 
-        invalidate(&store, SubstateCacheInvalidation::created(id.clone(), 6).unwrap(), 105).await;
+        invalidate(&store, SubstateCacheInvalidation::created(&id, 6).unwrap(), 105).await;
         assert_eq!(read(&store, &id).await, None);
     }
 
@@ -1039,7 +1458,7 @@ mod tests {
         let id = substate(1);
         assert!(put(&store, &id, 9, 100).await);
 
-        invalidate(&store, SubstateCacheInvalidation::created(id.clone(), 7).unwrap(), 105).await;
+        invalidate(&store, SubstateCacheInvalidation::created(&id, 7).unwrap(), 105).await;
         invalidate(&store, SubstateCacheInvalidation::destroyed(id.clone(), 8), 106).await;
         assert_eq!(read(&store, &id).await, Some(9));
     }
@@ -1096,7 +1515,7 @@ mod tests {
     async fn a_write_is_vetoed_by_a_transition_that_landed_during_the_fetch() {
         let (_d, store) = temp_store().await;
         let id = substate(1);
-        invalidate(&store, SubstateCacheInvalidation::created(id.clone(), 6).unwrap(), 105).await;
+        invalidate(&store, SubstateCacheInvalidation::created(&id, 6).unwrap(), 105).await;
 
         assert!(!put(&store, &id, 6, 100).await);
         assert_eq!(read(&store, &id).await, None);
@@ -1104,6 +1523,35 @@ mod tests {
         // The same result fetched against a watermark that already covers the transition is current.
         assert!(put(&store, &id, 6, 105).await);
         assert_eq!(read(&store, &id).await, Some(6));
+    }
+
+    /// Retirements driven by a finalized result are counted like the stream's own, so the counter
+    /// means what its name says.
+    #[tokio::test]
+    async fn retiring_ahead_of_the_stream_reports_what_it_retired() {
+        let (_d, store) = temp_store().await;
+        let held = substate(1);
+        let spent = substate(2);
+        let untouched = substate(3);
+        assert!(put(&store, &held, 6, 100).await);
+        assert!(put(&store, &spent, 6, 100).await);
+        assert!(put(&store, &untouched, 6, 100).await);
+
+        let ahead = StateVersion::new(101);
+        let invalidations = vec![
+            // Below the cached head, so it retires nothing.
+            (SubstateCacheInvalidation::created(&held, 4).unwrap(), ahead),
+            (SubstateCacheInvalidation::destroyed(spent.clone(), 6), ahead),
+        ];
+        let retired = store
+            .with_write_tx(move |tx| tx.substate_cache_retire_ahead(invalidations))
+            .await
+            .unwrap();
+
+        assert_eq!(retired, 1);
+        assert_eq!(read(&store, &held).await, Some(6));
+        assert_eq!(read(&store, &spent).await, None);
+        assert_eq!(read(&store, &untouched).await, Some(6));
     }
 
     #[tokio::test]
@@ -1114,7 +1562,12 @@ mod tests {
         for n in 0..5u8 {
             assert!(put_entry(&store, &substate(n), 1, true, now - u64::from(4 - n), 100).await);
         }
-        invalidate(&store, SubstateCacheInvalidation::created(substate(9), 1).unwrap(), 105).await;
+        invalidate(
+            &store,
+            SubstateCacheInvalidation::created(&substate(9), 1).unwrap(),
+            105,
+        )
+        .await;
 
         store
             .with_write_tx(|tx| tx.substate_cache_prune(Duration::ZERO, 2))
@@ -1131,5 +1584,43 @@ mod tests {
 
         // With the journal expired, a fetch that started before the transition is no longer vetoed.
         assert!(put(&store, &substate(9), 1, 100).await);
+    }
+
+    /// The backfill must clear every value written under the old rule — vault events and anything
+    /// else whose substate_id is not a resource — and leave the resource events alone. `resource_`
+    /// ends in a LIKE single-character wildcard, so a row like `resourceXcc` is what the escaping
+    /// exists to catch.
+    #[test]
+    fn the_backfill_clears_every_non_resource_resource_address() {
+        use diesel::{QueryableByName, connection::SimpleConnection, sql_types::Text};
+
+        #[derive(QueryableByName)]
+        struct Row {
+            #[diesel(sql_type = Text)]
+            substate_id: String,
+        }
+
+        let mut conn = SqliteConnection::establish(":memory:").unwrap();
+        conn.batch_execute(
+            "CREATE TABLE events (substate_id TEXT NULL, resource_address TEXT NULL);
+             INSERT INTO events VALUES
+               ('resource_aa', 'resource_aa'),
+               ('vault_bb', 'resource_aa'),
+               ('resourceXcc', 'resource_aa'),
+               ('component_dd', 'resource_aa'),
+               (NULL, 'resource_aa');",
+        )
+        .unwrap();
+
+        conn.batch_execute(include_str!(
+            "migrations/2026-09-15-000000_events_resource_address_resource_only/up.sql"
+        ))
+        .unwrap();
+
+        let kept = sql_query("SELECT substate_id FROM events WHERE resource_address IS NOT NULL")
+            .load::<Row>(&mut conn)
+            .unwrap();
+        let kept: Vec<&str> = kept.iter().map(|r| r.substate_id.as_str()).collect();
+        assert_eq!(kept, ["resource_aa"]);
     }
 }

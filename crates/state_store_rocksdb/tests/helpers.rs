@@ -1,7 +1,7 @@
 //   Copyright 2026 The Tari Project
 //   SPDX-License-Identifier: BSD-3-Clause
 
-use std::{io::Write, ops::Deref};
+use std::{collections::BTreeMap, io::Write, ops::Deref};
 
 use rand::{Rng, RngExt};
 use tari_bor::cbor;
@@ -16,6 +16,7 @@ use tari_ootle_common_types::{
     ExtraData,
     NodeHeight,
     NumPreshards,
+    ProtocolVersion,
     ShardGroup,
     VersionedSubstateId,
     VersionedSubstateIdRef,
@@ -23,6 +24,8 @@ use tari_ootle_common_types::{
     shard::Shard,
 };
 use tari_ootle_storage::{
+    ShardScopedTreeStoreWriter,
+    StateStore,
     StateStoreReadTransaction,
     StateStoreWriteTransaction,
     consensus_models::{
@@ -43,7 +46,7 @@ use tari_ootle_storage::{
 use tari_ootle_transaction::{Network, TransactionId};
 use tari_sidechain::{CommitProofElement, QuorumDecision, SidechainBlockCommitProof, SidechainBlockHeader};
 use tari_state_store_rocksdb::{DatabaseOptions, RocksDbStateStore};
-use tari_state_tree::Version;
+use tari_state_tree::{SpreadPrefixStateTree, SubstateTreeChange, Version};
 use tari_template_lib::types::{
     ComponentAddress,
     ComponentKey,
@@ -304,6 +307,7 @@ pub fn create_block(parent: Option<&Block>) -> Block {
 
     Block::create(
         network,
+        ProtocolVersion::V0,
         *parent.id(),
         parent.justify().clone(),
         None,
@@ -338,6 +342,7 @@ pub fn create_block_with_qc(parent: &LeafBlock) -> Block {
 
     Block::create(
         network,
+        ProtocolVersion::V0,
         *parent.block_id(),
         qc,
         None,
@@ -421,6 +426,7 @@ pub fn create_foreign_proposal(parent_id: BlockId, epoch: Epoch) -> ForeignPropo
 
     let foreign_block = Block::create(
         Network::LocalNet,
+        ProtocolVersion::V0,
         parent_id,
         qc1.clone(),
         None,
@@ -441,6 +447,7 @@ pub fn create_foreign_proposal(parent_id: BlockId, epoch: Epoch) -> ForeignPropo
     let commit_proof = CommandsCommitProof::new_latest(vec![], SidechainBlockCommitProof {
         header: SidechainBlockHeader {
             network: foreign_block.network().as_byte(),
+            protocol_version: foreign_block.header().protocol_version().as_u32(),
             parent_id: *parent_id.hash(),
             justify_id: *qc1.calculate_id().hash(),
             height: foreign_block.height().as_u64(),
@@ -462,6 +469,9 @@ pub fn create_foreign_proposal(parent_id: BlockId, epoch: Epoch) -> ForeignPropo
             tari_sidechain::QuorumCertificate {
                 header_hash: foreign_block.header().calculate_hash(),
                 parent_id: *parent_id.hash(),
+                epoch: foreign_block.epoch().as_u64(),
+                height: foreign_block.height().as_u64(),
+                protocol_version: foreign_block.header().protocol_version().as_u32(),
                 signatures: vec![],
                 decision: QuorumDecision::Accept,
             },
@@ -469,4 +479,38 @@ pub fn create_foreign_proposal(parent_id: BlockId, epoch: Epoch) -> ForeignPropo
     });
 
     ForeignProposalRecord::new(ForeignProposal::new(commit_proof, BlockPledge::default()))
+}
+
+/// The state-tree version the substates committed by [`commit_substates`] land at.
+pub const PROOF_TEST_TREE_VERSION: Version = 1;
+
+/// Commits `substates` to the store and to their shards' state trees, as a validator does when a
+/// block commits, so that proofs can be generated against the resulting shard-group root.
+pub fn commit_substates(db: &impl StateStore, substates: &[SubstateRecord]) {
+    let mut by_shard: BTreeMap<Shard, Vec<&SubstateRecord>> = BTreeMap::new();
+    for substate in substates {
+        by_shard.entry(substate.created().in_shard).or_default().push(substate);
+    }
+
+    let mut tx = db.create_write_tx().unwrap();
+    Block::zero_block(NETWORK, num_preshards()).insert(&mut tx).unwrap();
+
+    for (shard, substates) in &by_shard {
+        let changes = substates.iter().map(|s| SubstateTreeChange::Up {
+            id: s.to_versioned_substate_id(),
+            value_hash: *s.state_hash(),
+        });
+        {
+            let mut store = ShardScopedTreeStoreWriter::new(&mut tx, *shard);
+            SpreadPrefixStateTree::new(&mut store)
+                .batch_put_substate_changes(None, PROOF_TEST_TREE_VERSION, changes)
+                .unwrap();
+        }
+        tx.state_tree_shard_versions_set(*shard, PROOF_TEST_TREE_VERSION)
+            .unwrap();
+    }
+
+    tx.substates_commit_batch(create_substate_update_batch(Epoch::zero(), substates))
+        .unwrap();
+    tx.commit().unwrap();
 }

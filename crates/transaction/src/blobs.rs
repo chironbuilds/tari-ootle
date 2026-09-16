@@ -127,6 +127,9 @@ pub fn hash_blob(blob: &Blob) -> Hash32 {
 pub struct Blobs(#[n(0)] Vec<Blob>);
 
 impl Blobs {
+    /// Blobs a transaction may carry: every index must fit a [`BlobIndex`].
+    pub const MAX_BLOBS: usize = BlobIndex::MAX as usize + 1;
+
     pub fn empty() -> Self {
         Self(Vec::new())
     }
@@ -139,7 +142,7 @@ impl Blobs {
     ///
     /// Returns `Err` if the blob count would exceed the `BlobIndex` range.
     pub fn push(&mut self, blob: Blob) -> Result<BlobIndex, BlobIndexOverflow> {
-        let max = BlobIndex::MAX as usize + 1;
+        let max = Self::MAX_BLOBS;
         if self.0.len() >= max {
             return Err(BlobIndexOverflow { max });
         }
@@ -172,6 +175,15 @@ impl Blobs {
     /// `BlobHashes`. This is the only public way to obtain a `BlobHashes`.
     pub fn hashes(&self) -> BlobHashes {
         BlobHashes(self.0.iter().map(hash_blob).collect())
+    }
+}
+
+impl IntoIterator for Blobs {
+    type IntoIter = <Vec<Blob> as IntoIterator>::IntoIter;
+    type Item = Blob;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
     }
 }
 

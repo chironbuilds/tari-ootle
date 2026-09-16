@@ -5,10 +5,9 @@ export type FeeSource =
   | "RuntimeCall"
   | "Storage"
   | "TransactionWeight"
-  | "SignatureVerification"
   | "TemplateLoad"
   | "SubstateCreate"
   | "WasmExecution"
   | "TemplatePublish"
-  | "ExhaustBurn"
+  | "Reserved"
   | "NativeExecution";

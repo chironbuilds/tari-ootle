@@ -21,11 +21,11 @@ use tari_engine_types::{
     confidential_output::ConfidentialOutput,
     crypto,
     events::Event,
-    fees::{FeeReceipt, FeeSource},
+    fees::{ExhaustBurnRate, FeeReceipt},
     id_provider::{IdProvider, ObjectIds},
     indexed_value::{IndexedValue, IndexedWellKnownTypes},
     limits,
-    lock::LockFlag,
+    lock::{LockFlag, LockId},
     logs::LogEntry,
     non_fungible::NonFungibleContainer,
     proof::{ContainerRef, LockedResource, Proof},
@@ -76,10 +76,9 @@ use crate::{
         RuntimeError,
         TransactionCommitError,
         address_allocation::AllocatedAddress,
-        fee_state,
         fee_state::FeeState,
         locking::LockedSubstate,
-        scope::{CallFrame, CallScope},
+        scope::{CallFrame, CallScope, FrameWriteMode},
         state_store::WorkingStateStore,
         tracker_auth::Authorization,
         validation::{
@@ -146,8 +145,12 @@ pub(super) struct WorkingState<TStore> {
     events: Vec<Event>,
     logs: Vec<LogEntry>,
     buckets: HashMap<BucketId, Bucket>,
-    address_allocations: HashMap<AddressAllocationId, AllocatedAddress>,
-    used_address_allocations: HashMap<AddressAllocationId, SubstateId>,
+    /// `get_allocated_address_by_address` scans these, and two allocations can name the same address, so the
+    /// iteration order decides which one a lookup finds. It must therefore follow from the transaction's own
+    /// operations rather than from a hash seed.
+    address_allocations: IndexMap<AddressAllocationId, AllocatedAddress>,
+    /// Only ever inserted into and looked up by id. Ordered for symmetry with `address_allocations`.
+    used_address_allocations: IndexMap<AddressAllocationId, SubstateId>,
     address_allocation_id: u32,
     proofs: HashMap<ProofId, Proof>,
     object_ids: ObjectIds,
@@ -182,12 +185,12 @@ impl<TStore: StateReader> WorkingState<TStore> {
         initial_call_scope: CallScope,
         transaction_hash: Hash32,
         intent_commitment: Hash32,
-        burn_rate_bps: u16,
+        burn_rate: ExhaustBurnRate,
         network: Network,
         dry_run: bool,
     ) -> Self {
         let mut fee_state = FeeState::new();
-        fee_state.set_burn_rate_bps(burn_rate_bps);
+        fee_state.set_burn_rate(burn_rate);
         fee_state.set_dry_run(dry_run);
         Self {
             network,
@@ -198,8 +201,8 @@ impl<TStore: StateReader> WorkingState<TStore> {
             buckets: HashMap::new(),
             proofs: HashMap::new(),
             address_allocation_id: 0,
-            address_allocations: HashMap::new(),
-            used_address_allocations: HashMap::new(),
+            address_allocations: IndexMap::new(),
+            used_address_allocations: IndexMap::new(),
 
             store: WorkingStateStore::new(state_store),
 
@@ -235,14 +238,14 @@ impl<TStore: StateReader> WorkingState<TStore> {
         self.store.exists(address)
     }
 
-    fn enforce_substate_size_limit(&self, value: &SubstateValue) -> Result<(), RuntimeError> {
+    fn enforce_substate_size_limit(id: &SubstateId, value: &SubstateValue) -> Result<(), RuntimeError> {
         // Published template has its own size restriction
         if value.published_template().is_some() {
             return Ok(());
         }
-        let size = encoded_len(value)?;
+        let size = encoded_len(value);
         if size > limits::ENGINE_LIMITS.max_substate_size {
-            return Err(LimitError::SubstateSizeExceeded { size }.into());
+            return Err(LimitError::SubstateSizeExceeded { id: id.clone(), size }.into());
         }
         Ok(())
     }
@@ -252,20 +255,33 @@ impl<TStore: StateReader> WorkingState<TStore> {
         address: K,
         value: V,
     ) -> Result<(), RuntimeError> {
-        if self.is_read_only_context() {
-            return Err(RuntimeError::WriteInReadOnlyContext);
-        }
         let address = address.into();
+        self.check_write_allowed(&address)?;
         let value = value.into();
-        self.enforce_substate_size_limit(&value)?;
+        Self::enforce_substate_size_limit(&address, &value)?;
         self.current_call_scope_mut()?.add_substate_to_scope(address.clone())?;
         self.store.insert(address, value)?;
         Ok(())
     }
 
     fn lock_substate(&mut self, addr: SubstateId, lock_flag: LockFlag) -> Result<LockedSubstate, RuntimeError> {
-        let lock_id = self.store.try_lock(addr.clone(), lock_flag)?;
+        let lock_id = self.try_lock(addr.clone(), lock_flag)?;
+        // Every lock a frame takes must be released before that frame is popped, which `pop_frame` enforces. A lock
+        // taken before the first frame is pushed — fee settlement, transaction setup — belongs to no frame and is
+        // left untracked.
+        if let Some(frame) = self.call_frames.last_mut() {
+            frame.scope_mut().add_lock_to_scope(lock_id);
+        }
         Ok(LockedSubstate::new(addr, lock_id, lock_flag))
+    }
+
+    /// Every lock this state takes goes through here, so a write lock cannot be acquired without the frame write
+    /// mode permitting it. Callers that need the raw [`LockId`] use this directly rather than the store.
+    fn try_lock(&mut self, addr: SubstateId, lock_flag: LockFlag) -> Result<LockId, RuntimeError> {
+        if lock_flag.is_write() {
+            self.check_write_allowed(&addr)?;
+        }
+        self.store.try_lock(addr, lock_flag)
     }
 
     pub fn read_lock_substate(&mut self, addr: SubstateId) -> Result<LockedSubstate, RuntimeError> {
@@ -273,14 +289,29 @@ impl<TStore: StateReader> WorkingState<TStore> {
     }
 
     pub fn write_lock_substate(&mut self, addr: SubstateId) -> Result<LockedSubstate, RuntimeError> {
-        if self.is_read_only_context() {
-            return Err(RuntimeError::WriteInReadOnlyContext);
-        }
         self.lock_substate(addr, LockFlag::Write)
+    }
+
+    /// The single chokepoint for the frame write mode. In `OwnComponent` mode the only permitted write is to the
+    /// component locked at frame push, and that goes through the existing lock rather than a new one, so every
+    /// request for a new write lock or a new substate is refused.
+    fn check_write_allowed(&self, addr: &SubstateId) -> Result<(), RuntimeError> {
+        match self.current_frame_write_mode() {
+            FrameWriteMode::Full => Ok(()),
+            FrameWriteMode::OwnComponent => Err(RuntimeError::WriteOutsideOwnComponent { id: addr.clone() }),
+            FrameWriteMode::ReadOnly => Err(RuntimeError::WriteInReadOnlyContext),
+        }
     }
 
     pub fn unlock_substate(&mut self, lock: LockedSubstate) -> Result<(), RuntimeError> {
         self.store.try_unlock(lock.lock_id())?;
+        // The frame releasing a lock need not be the one that took it: a component lock is taken by the caller and
+        // released when the frame it was pushed into is popped, by which point that frame is off the stack.
+        for frame in self.call_frames.iter_mut().rev() {
+            if frame.scope_mut().remove_lock_from_scope(lock.lock_id()) {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -381,7 +412,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
 
         for input in &stmt.inputs_statement.inputs {
             let address = UtxoAddress::new(resource_address, input.commitment.into());
-            let lock_id = self.store.try_lock(address.clone().into(), LockFlag::Write)?;
+            let lock_id = self.try_lock(address.clone().into(), LockFlag::Write)?;
             let utxo = self.store.down_utxo(lock_id)?;
             self.store.try_unlock(lock_id)?;
             if utxo.is_frozen() {
@@ -535,9 +566,19 @@ impl<TStore: StateReader> WorkingState<TStore> {
     }
 
     pub(super) fn validate_finalized(&self) -> Result<(), RuntimeError> {
-        if self.buckets.iter().any(|(_, b)| !b.is_empty()) {
+        // A substate can be grown through any of the `&mut SubstateValue` handles this state hands out, so the
+        // size limit binds on every substate the transaction's instructions persist rather than on what was
+        // created. Measured here, where the set to persist is known, rather than at each write: a substate a
+        // transaction writes many times would otherwise be measured many times.
+        for (id, value) in self.store.mutated_substates() {
+            Self::enforce_substate_size_limit(id, value)?;
+        }
+
+        // An emptied bucket carries nothing and is tolerated, so the count is of those that are not empty.
+        let dangling_buckets = self.buckets.iter().filter(|(_, bucket)| !bucket.is_empty()).count();
+        if dangling_buckets > 0 {
             return Err(TransactionCommitError::DanglingBuckets {
-                count: self.buckets.len(),
+                count: dangling_buckets,
             }
             .into());
         }
@@ -557,7 +598,9 @@ impl<TStore: StateReader> WorkingState<TStore> {
         }
 
         for (vault_id, vault) in self.store.new_vaults() {
-            if !vault.locked_balance().is_zero() {
+            // A confidential vault's locked value is a set of commitments whose amounts are hidden, so the locked
+            // balance alone reports zero for it.
+            if vault.has_locked_funds() {
                 return Err(TransactionCommitError::DanglingLockedValueInVault {
                     vault_id,
                     locked_amount: vault.locked_balance(),
@@ -587,6 +630,15 @@ impl<TStore: StateReader> WorkingState<TStore> {
         self.proofs
             .get(&proof_id)
             .ok_or(RuntimeError::ProofNotFound { proof_id })
+    }
+
+    /// Reads a proof the current frame holds. Proof ids come from a counter shared by the whole transaction, so the
+    /// scope check is what keeps one frame from reading the contents of another frame's proof.
+    pub fn get_proof_in_scope(&self, proof_id: ProofId) -> Result<&Proof, RuntimeError> {
+        if !self.current_call_scope()?.is_proof_in_scope(&proof_id) {
+            return Err(RuntimeError::ProofNotInScope { proof_id });
+        }
+        self.get_proof(proof_id)
     }
 
     pub fn proof_exists(&self, proof_id: ProofId) -> bool {
@@ -641,7 +693,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
             .into_iter()
             .map(|commitment| {
                 let address = ConfidentialOutputAddress::new(resource_address, commitment);
-                let lock_id = self.store.try_lock(address.clone().into(), LockFlag::Write)?;
+                let lock_id = self.try_lock(address.clone().into(), LockFlag::Write)?;
                 let output = self.store.down_confidential_output(lock_id)?;
                 self.store.try_unlock(lock_id)?;
                 if output.is_frozen() {
@@ -761,7 +813,8 @@ impl<TStore: StateReader> WorkingState<TStore> {
         // it. Callers reject this earlier to avoid charging for a burn that cannot succeed; the check lives here so
         // that it holds for every caller.
         if bucket.has_locked_funds() {
-            return Err(RuntimeError::InvalidOpDepositLockedBucket {
+            return Err(RuntimeError::InvalidOpLockedBucket {
+                op: "burn",
                 bucket_id,
                 locked_amount: bucket.locked_amount(),
             });
@@ -829,7 +882,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
     pub fn drop_proof(&mut self, proof_id: ProofId) -> Result<(), RuntimeError> {
         let call_frame_mut = self.current_call_scope_mut()?;
         if !call_frame_mut.is_proof_in_scope(&proof_id) {
-            return Err(RuntimeError::ProofNotFound { proof_id });
+            return Err(RuntimeError::ProofNotInScope { proof_id });
         }
         call_frame_mut.remove_proof_from_scope(&proof_id);
 
@@ -1178,7 +1231,13 @@ impl<TStore: StateReader> WorkingState<TStore> {
         address: T,
     ) -> Result<AddressAllocationId, RuntimeError> {
         let id = self.address_allocation_id;
-        self.address_allocation_id += 1;
+        self.address_allocation_id = self
+            .address_allocation_id
+            .checked_add(1)
+            .ok_or(RuntimeError::InvariantError {
+                function: "new_address_allocation",
+                details: "address allocation id counter overflowed".to_string(),
+            })?;
         let current_template = self.current_template().ok().copied();
         self.address_allocations
             .insert(id, AllocatedAddress::new(address.into(), current_template));
@@ -1214,7 +1273,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
         }
         let alloc_addr = self
             .address_allocations
-            .remove(&id)
+            .swap_remove(&id)
             .ok_or(RuntimeError::AddressAllocationNotFound { id })?;
         self.current_call_scope_mut()?.remove_address_allocation_from_scope(id);
         self.used_address_allocations
@@ -1282,6 +1341,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
         let (amount, resource_container) = pool_mut.withdraw_up_to(max_amount)?;
         self.validator_fee_withdrawals
             .push(ValidatorFeeWithdrawal { address, amount });
+        self.unlock_substate(locked_substate)?;
         Ok(resource_container)
     }
 
@@ -1300,6 +1360,33 @@ impl<TStore: StateReader> WorkingState<TStore> {
                     });
                 }
             }
+        }
+
+        // A bucket, proof or address allocation is a capability the transaction holds, named by a counter that
+        // restarts at zero every transaction. Persisting one stores an id that can only ever alias an unrelated
+        // object of a later transaction — and component state is handed to a resource auth hook as an argument,
+        // where an id in it is read as a capability the hook was lent.
+        //
+        // `validate_finalized` rejects one of these left live at the end of a transaction, which covers the
+        // careless cases. It cannot see an id whose object is gone or empty by then: a proof dropped from the
+        // workspace, or a bucket emptied into another. Those are what this check carries.
+        if let Some(id) = next_state.bucket_ids().first() {
+            return Err(RuntimeError::transient_in_component_state("bucket", id));
+        }
+        if let Some(id) = next_state.proof_ids().first() {
+            return Err(RuntimeError::transient_in_component_state("proof", id));
+        }
+        if let Some(alloc) = next_state.component_address_allocations().first() {
+            return Err(RuntimeError::transient_in_component_state(
+                "component address allocation",
+                alloc.id(),
+            ));
+        }
+        if let Some(alloc) = next_state.resource_address_allocations().first() {
+            return Err(RuntimeError::transient_in_component_state(
+                "resource address allocation",
+                alloc.id(),
+            ));
         }
 
         // Check that no vaults are duplicated
@@ -1431,19 +1518,33 @@ impl<TStore: StateReader> WorkingState<TStore> {
         self.call_frames.last().ok_or(RuntimeError::NoActiveCallFrame)
     }
 
-    /// Whether the current call frame is a read-only sandbox (a spend-script predicate frame). When
-    /// true, `write_lock_substate` and `new_substate` reject with `RuntimeError::WriteInReadOnlyContext`.
-    pub fn is_read_only_context(&self) -> bool {
-        self.call_frames.last().map(|f| f.is_read_only()).unwrap_or(false)
+    /// The write mode of the current call frame. Outside any frame (top-level instruction processing) writes
+    /// are unrestricted.
+    pub fn current_frame_write_mode(&self) -> FrameWriteMode {
+        self.call_frames
+            .last()
+            .map(|f| f.write_mode())
+            .unwrap_or(FrameWriteMode::Full)
     }
 
-    /// Marks the current (most recently pushed) call frame as a read-only spend-script sandbox. Must be
-    /// called immediately after the predicate frame is pushed and before the predicate executes.
-    pub fn make_current_frame_read_only(&mut self) -> Result<(), RuntimeError> {
+    /// Restricts the current (most recently pushed) call frame to `mode` and disables its cross-template calls.
+    /// Must be called immediately after the frame is pushed and before its code executes.
+    pub fn restrict_current_frame(&mut self, mode: FrameWriteMode) -> Result<(), RuntimeError> {
         self.call_frames
             .last_mut()
             .ok_or(RuntimeError::NoActiveCallFrame)?
-            .restrict_to_read_only();
+            .restrict(mode);
+        Ok(())
+    }
+
+    /// Takes the boundary proofs away from the current (most recently pushed) call frame. Must be called once the
+    /// frame's access rule has been evaluated and before anything acts in the frame.
+    pub fn revoke_boundary_proofs(&mut self) -> Result<(), RuntimeError> {
+        self.call_frames
+            .last_mut()
+            .ok_or(RuntimeError::NoActiveCallFrame)?
+            .scope_mut()
+            .revoke_boundary_proofs();
         Ok(())
     }
 
@@ -1471,15 +1572,17 @@ impl<TStore: StateReader> WorkingState<TStore> {
         Ok(frame.current_template_name())
     }
 
-    pub fn id_provider(&self) -> Result<IdProvider<'_>, RuntimeError> {
-        self.call_frames
+    pub fn id_provider(&mut self) -> Result<IdProvider<'_>, RuntimeError> {
+        let entity_id = self
+            .call_frames
             .last()
-            .map(|frame| IdProvider::new(frame.entity_id(), self.transaction_hash, &self.object_ids))
-            .ok_or(RuntimeError::NoActiveCallFrame)
+            .map(|frame| frame.entity_id())
+            .ok_or(RuntimeError::NoActiveCallFrame)?;
+        Ok(IdProvider::new(entity_id, self.transaction_hash, &mut self.object_ids))
     }
 
-    pub fn id_provider_for_entity(&self, entity_id: EntityId) -> IdProvider<'_> {
-        IdProvider::new(entity_id, self.transaction_hash, &self.object_ids)
+    pub fn id_provider_for_entity(&mut self, entity_id: EntityId) -> IdProvider<'_> {
+        IdProvider::new(entity_id, self.transaction_hash, &mut self.object_ids)
     }
 
     pub fn new_bucket_id(&mut self) -> BucketId {
@@ -1495,7 +1598,15 @@ impl<TStore: StateReader> WorkingState<TStore> {
             .and_then(|lock| lock.substate_id().as_component_address()))
     }
 
-    pub fn get_auth_caller(&self) -> Result<AuthHookCaller, RuntimeError> {
+    pub fn get_auth_caller(&self, resource_lock: &LockedSubstate) -> Result<AuthHookCaller, RuntimeError> {
+        let resource_address =
+            resource_lock
+                .substate_id()
+                .as_resource_address()
+                .ok_or_else(|| RuntimeError::InvariantError {
+                    function: "get_auth_caller",
+                    details: format!("Expected a resource lock, got {}", resource_lock.substate_id()),
+                })?;
         let frame = self.call_frames.last().ok_or(RuntimeError::NoActiveCallFrame)?;
         let template = frame.current_template();
         let component = frame
@@ -1503,7 +1614,7 @@ impl<TStore: StateReader> WorkingState<TStore> {
             .get_current_component_lock()
             .and_then(|lock| lock.substate_id().as_component_address());
 
-        Ok(AuthHookCaller::new(*template, component))
+        Ok(AuthHookCaller::new(resource_address, *template, component))
     }
 
     pub fn push_frame(&mut self, mut new_frame: CallFrame, max_call_depth: usize) -> Result<(), RuntimeError> {
@@ -1513,15 +1624,27 @@ impl<TStore: StateReader> WorkingState<TStore> {
             });
         }
 
-        let current = self.current_call_scope()?;
-        new_frame.scope_mut().update_from_parent(current);
-
-        if self.call_frame_depth() == 0 {
+        match self.call_frames.last() {
             // If this is the first call frame, then we use the base auth scope (virtual proofs are carried from the
-            // base to the first call scope)
-            new_frame
-                .scope_mut()
-                .set_auth_scope(self.initial_call_scope.auth_scope().clone());
+            // base to the first call scope). A top-level instruction has no caller frame, so there is no caller
+            // identity to stamp: the signer is the caller.
+            None => {
+                new_frame
+                    .scope_mut()
+                    .set_auth_scope(self.initial_call_scope.auth_scope().clone());
+            },
+            // Otherwise stamp the pushing frame's identity into the callee's scope as virtual badges. This is the
+            // callee's only view of who called it, and it is not inherited: the frame the callee pushes in turn gets
+            // the callee's identity, not this one.
+            Some(caller) => {
+                let component = caller
+                    .scope()
+                    .get_current_component_lock()
+                    .and_then(|lock| lock.substate_id().as_component_address());
+                let template = *caller.current_template();
+                new_frame.scope_mut().auth_scope_mut().set_caller(component, template);
+                new_frame.inherit_restrictions(caller);
+            },
         }
 
         self.call_frames.push(new_frame);
@@ -1861,6 +1984,11 @@ impl<TStore: StateReader> WorkingState<TStore> {
         if self.events.len() >= limits::ENGINE_LIMITS.max_events {
             return Err(LimitError::MaxEventsExceeded.into());
         }
+
+        let size = encoded_len(&event);
+        if size > limits::ENGINE_LIMITS.max_event_size_bytes {
+            return Err(LimitError::EventSizeExceeded { size }.into());
+        }
         self.events.push(event);
         Ok(())
     }
@@ -1884,11 +2012,16 @@ impl<TStore: StateReader> WorkingState<TStore> {
         let mut total_fee_overcharge = 0;
         // First collect fees that cannot be refunded (we have to take all fees even if they exceed the required amount)
         for resx in self.fee_state.non_refundable_fee_payments_mut_iter() {
-            // PANIC: this is checked by FeeState
             let paid_amount = resx
                 .unlocked_amount()
                 .to_u64_checked()
-                .expect("invalid fee entry in fee state");
+                .ok_or_else(|| RuntimeError::InvariantError {
+                    function: "finalize_fees_and_refunds",
+                    details: format!(
+                        "Non-refundable fee payment {} does not fit in a u64",
+                        resx.unlocked_amount()
+                    ),
+                })?;
 
             debug!(
                 target: LOG_TARGET,
@@ -1915,11 +2048,16 @@ impl<TStore: StateReader> WorkingState<TStore> {
                     "Collecting {} of refundable fees", resx.unlocked_amount()
                 );
 
-                // PANIC: this is checked by FeeState
-                let paid_amount = resx
-                    .unlocked_amount()
-                    .to_u64_checked()
-                    .expect("invalid fee entry in fee state");
+                let paid_amount =
+                    resx.unlocked_amount()
+                        .to_u64_checked()
+                        .ok_or_else(|| RuntimeError::InvariantError {
+                            function: "finalize_fees_and_refunds",
+                            details: format!(
+                                "Refundable fee payment {} does not fit in a u64",
+                                resx.unlocked_amount()
+                            ),
+                        })?;
 
                 // Withdraw only what is needed
                 let amount_to_withdraw = cmp::min(paid_amount, remaining_fees);
@@ -1940,32 +2078,32 @@ impl<TStore: StateReader> WorkingState<TStore> {
             );
             let vault_mut = substates_to_persist
                 .get_mut(&SubstateId::Vault(*refund_vault))
-                .expect("invariant: vault that made fee payment not in changeset")
-                .as_vault_mut()
-                .expect("invariant: substate substate_id for fee refund is not a vault");
+                .and_then(|substate| substate.as_vault_mut())
+                .ok_or_else(|| RuntimeError::InvariantError {
+                    function: "finalize_fees_and_refunds",
+                    details: format!("Refund target {} is not a vault in the changeset", refund_vault),
+                })?;
             vault_mut.resource_container_mut().deposit(resx.withdraw_all()?)?;
         }
 
-        let total_fees_paid = fee_resource
-            .unlocked_amount()
-            .to_u64_checked()
-            .expect("FeeState guarantees that the total fee payments fit in an u64");
+        let total_fees_paid =
+            fee_resource
+                .unlocked_amount()
+                .to_u64_checked()
+                .ok_or_else(|| RuntimeError::InvariantError {
+                    function: "finalize_fees_and_refunds",
+                    details: format!("Collected fees {} do not fit in a u64", fee_resource.unlocked_amount()),
+                })?;
 
-        // The overcharge is kept by the network as if it were a fee payment inclusive of its own burn: its burn
-        // share moves into the exhaust burn bucket so that the burn consensus carries from the pre-burn fee matches
-        // the amount actually withheld from validators.
-        let rate_bps = self.fee_state.burn_rate_bps();
-        if total_fee_overcharge > 0 && rate_bps > 0 {
-            let (validator_share, burn_share) = fee_state::split_overcharge(total_fee_overcharge, rate_bps);
-            self.fee_state.add_charge(FeeSource::ExhaustBurn, burn_share);
-            total_fee_overcharge = validator_share;
-        }
+        // The burn is a share of what was collected, overcharge included, and leaders receive the rest.
+        let exhaust_burn = exhaust_burn_share(total_fees_paid, self.fee_state.burn_rate());
 
         Ok(FeeReceipt::builder()
             .with_total_fee_payment(total_fee_payment)
             .with_total_fees_paid(total_fees_paid)
             .with_total_fee_overcharge(total_fee_overcharge)
             .with_cost_breakdown(self.fee_state.take_fee_charges())
+            .with_exhaust_burn(exhaust_burn)
             .build())
     }
 
@@ -1988,7 +2126,15 @@ impl<TStore: StateReader> WorkingState<TStore> {
                         // If there are no fees left, do not up the fee pool
                         continue;
                     }
-                    Substate::new(existing_state.version() + 1, substate)
+                    let version =
+                        existing_state
+                            .version()
+                            .checked_add(1)
+                            .ok_or_else(|| RuntimeError::InvariantError {
+                                function: "generate_substate_diff",
+                                details: format!("version of substate {id} overflowed"),
+                            })?;
+                    Substate::new(version, substate)
                 },
                 None => Substate::new(0, substate),
             };
@@ -2081,6 +2227,17 @@ impl<TStore: StateReader> WorkingState<TStore> {
         }
 
         let revealed_funds_bucket = revealed_funds_bucket_id.map(|id| self.take_bucket(id)).transpose()?;
+        // The bucket is consumed whole by the transfer, so funds a proof has locked in it would be destroyed while
+        // the proof still names it.
+        if let (Some(bucket_id), Some(bucket)) = (revealed_funds_bucket_id, revealed_funds_bucket.as_ref()) &&
+            bucket.has_locked_funds()
+        {
+            return Err(RuntimeError::InvalidOpLockedBucket {
+                op: "stealth transfer from",
+                bucket_id,
+                locked_amount: bucket.locked_amount(),
+            });
+        }
         if let Some(ref bucket) = revealed_funds_bucket &&
             *bucket.resource_address() != resource_address
         {
@@ -2152,5 +2309,42 @@ impl<TStore: StateReader> WorkingState<TStore> {
         let container = ResourceContainer::stealth(resource_address, valid_transfer.revealed_output_amount);
 
         Ok(Some(container))
+    }
+}
+
+/// The share of `paid` that is burned at `rate`: `⌊paid × rate / 10_000⌋`. Never exceeds `paid`
+/// because `ExhaustBurnRate` caps the rate at 10_000, so the leader share `paid − burn` cannot go
+/// negative and a full rate leaves leaders exactly nothing.
+fn exhaust_burn_share(paid: u64, rate: ExhaustBurnRate) -> u64 {
+    // At most `paid × 10_000 / 10_000 = paid`, so the cast back is lossless.
+    (u128::from(paid) * u128::from(rate.as_bps()) / 10_000) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_burn_is_a_floor_share_of_what_was_paid_and_the_leader_gets_the_rest() {
+        for paid in [0u64, 1, 99, 100, 5_000, u64::MAX] {
+            for rate_bps in [0u16, 1, 500, 9_000, 10_000] {
+                let burn = exhaust_burn_share(paid, ExhaustBurnRate::new(rate_bps));
+                let leader = paid - burn;
+                assert_eq!(burn + leader, paid, "paid: {paid}, rate_bps: {rate_bps}");
+                assert_eq!(
+                    u128::from(burn),
+                    u128::from(paid) * u128::from(rate_bps) / 10_000,
+                    "paid: {paid}, rate_bps: {rate_bps}"
+                );
+                if rate_bps == 10_000 {
+                    assert_eq!(leader, 0, "a full rate leaves leaders nothing (paid: {paid})");
+                }
+                if rate_bps == 0 {
+                    assert_eq!(burn, 0, "a zero rate burns nothing (paid: {paid})");
+                }
+            }
+        }
+        assert_eq!(exhaust_burn_share(100, ExhaustBurnRate::new(500)), 5);
+        assert_eq!(exhaust_burn_share(105, ExhaustBurnRate::new(500)), 5);
     }
 }

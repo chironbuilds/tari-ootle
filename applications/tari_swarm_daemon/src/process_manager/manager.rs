@@ -13,7 +13,10 @@ use futures::future::Either;
 use log::{debug, info};
 use minotari_wallet_grpc_client::grpc;
 use tari_consensus::consensus_constants::ConsensusConstants;
-use tari_ootle_app_utilities::configuration::convert_network_to_l1_network;
+use tari_ootle_app_utilities::{
+    configuration::convert_network_to_l1_network,
+    consensus_constants_file::load_consensus_constants,
+};
 use tari_ootle_wallet_sdk::Network;
 use tari_shutdown::ShutdownSignal;
 use tari_transaction_components::consensus::NetworkConsensus;
@@ -23,10 +26,12 @@ use tokio::{sync::mpsc, time, time::sleep};
 use crate::{
     config::{Config, InstanceType},
     layer_one_transactions::LayerOneTransactionService,
+    process_definitions::CONSENSUS_CONSTANTS_FILE_NAME,
     process_manager::{
         InstanceId,
         MinoTariWalletProcess,
         MinotariNodeDetails,
+        crash_report,
         executables::ExecutableManager,
         handle::{ProcessManagerHandle, ProcessManagerRequest},
         instances::InstanceManager,
@@ -47,6 +52,7 @@ pub struct ProcessManager {
     skip_registration: bool,
     enable_manual_connect: bool,
     network: Network,
+    base_dir: PathBuf,
     config_path: PathBuf,
     config_last_modified: Option<SystemTime>,
 }
@@ -79,10 +85,19 @@ impl ProcessManager {
             shutdown_signal,
             enable_manual_connect: config.enable_manual_validator_connect,
             network: config.network,
+            base_dir: config.base_dir.clone(),
             config_path,
             config_last_modified,
         };
         (this, ProcessManagerHandle::new(tx_request))
+    }
+
+    /// The constants every node in this swarm was started with, read from the file the swarm wrote and
+    /// pointed them at.
+    fn consensus_constants(&self) -> anyhow::Result<ConsensusConstants> {
+        let path = self.base_dir.join(CONSENSUS_CONSTANTS_FILE_NAME);
+        let constants = load_consensus_constants(self.network, Some(&path), &path)?;
+        Ok(constants)
     }
 
     async fn start_up(&mut self) -> anyhow::Result<()> {
@@ -146,6 +161,7 @@ impl ProcessManager {
         layer_one_transaction_service: Option<&mut LayerOneTransactionService>,
     ) -> anyhow::Result<()> {
         if self.skip_registration {
+            info!("⏭️ Skipping validator node and template registration");
             return Ok(());
         }
 
@@ -223,10 +239,11 @@ impl ProcessManager {
         }) {
             if let Some(status) = instance.check_running()? {
                 return Err(anyhow!(
-                    "Failed to start instance: {} {} {}",
+                    "Failed to start instance: {} {} {}{}",
                     instance.name(),
                     instance.instance_type(),
-                    status
+                    status,
+                    crash_report::crash_report(instance)
                 ));
             }
         }
@@ -249,10 +266,11 @@ impl ProcessManager {
                     );
                 } else {
                     log::error!(
-                        "Instance exited with status {}: {} {}",
+                        "💥 Instance exited with status {}: {} {}{}",
                         status.code().unwrap_or(-1),
                         instance.name(),
-                        instance.instance_type()
+                        instance.instance_type(),
+                        crash_report::crash_report(instance)
                     );
                 }
                 // We only want to clear the miners, the rest we keep around to display that they are terminated
@@ -668,6 +686,8 @@ impl ProcessManager {
             .find(|vn| vn.instance().id() == instance_id)
             .ok_or_else(|| anyhow!("Validator node with ID '{}' not found", instance_id))?;
 
+        info!("🟡 Registering validator node {}", vn.instance().name());
+
         if !vn.instance().is_running() {
             log::error!(
                 "Skipping registration for validator node {}: {} since it is not running",
@@ -737,8 +757,9 @@ impl ProcessManager {
             .pop()
             .ok_or_else(|| anyhow!("No layer one consensus constants for network {}", self.network))?
             .epoch_length();
-        // Must match the validator's oracle lag (`height_lag`), which is set from this constant.
-        let confirmations = ConsensusConstants::from(self.network).base_layer_confirmations;
+        // Must match the validator's oracle lag (`height_lag`), which is set from this constant - and
+        // so from the same file the validators are pointed at.
+        let confirmations = self.consensus_constants()?.base_layer_confirmations;
 
         let tip = self.get_base_layer_tip_height().await?;
         // The registrations are broadcast and confirm in the next block mined.
@@ -822,6 +843,7 @@ impl ProcessManager {
         if blocks == 0 {
             return Ok(());
         }
+        info!("⛏️ Mining {blocks} block(s)");
         let executable = self
             .executable_manager
             .get_executable(InstanceType::MinoTariMiner)

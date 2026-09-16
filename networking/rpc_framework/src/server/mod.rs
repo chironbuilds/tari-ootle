@@ -30,9 +30,6 @@ use handle::RpcServerRequest;
 #[cfg(feature = "metrics")]
 mod metrics;
 
-// TODO: Tests
-// pub mod mock;
-
 mod early_close;
 mod router;
 
@@ -48,7 +45,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use futures::{SinkExt, StreamExt, stream::FuturesUnordered};
+use futures::{AsyncRead, AsyncWrite, SinkExt, StreamExt, stream::FuturesUnordered};
 use libp2p::{PeerId, StreamProtocol};
 use libp2p_substream::{ProtocolEvent, ProtocolNotification};
 use log::*;
@@ -61,7 +58,6 @@ use tracing::{Instrument, Level, debug, error, instrument, span, trace, warn};
 use super::{
     Handshake,
     RPC_MAX_FRAME_SIZE,
-    Substream,
     body::Body,
     error::HandshakeRejectReason,
     max_response_payload_size,
@@ -126,12 +122,13 @@ impl RpcServer {
         RpcServerHandle::new(self.request_tx.clone())
     }
 
-    pub(super) async fn serve<S>(
+    pub(super) async fn serve<S, TSubstream>(
         self,
         service: S,
-        notifications: ProtocolNotificationRx<Substream>,
+        notifications: ProtocolNotificationRx<TSubstream>,
     ) -> Result<(), RpcServerError>
     where
+        TSubstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
         S: MakeService<
                 StreamProtocol,
                 Request<Bytes>,
@@ -162,6 +159,7 @@ pub struct RpcServerBuilder {
     maximum_simultaneous_sessions: Option<usize>,
     maximum_sessions_per_client: Option<usize>,
     minimum_client_deadline: Duration,
+    minimum_keepalive_interval: Duration,
     handshake_timeout: Duration,
 }
 
@@ -195,6 +193,21 @@ impl RpcServerBuilder {
         self
     }
 
+    /// Sets the shortest keepalive interval the server is willing to emit. A client asking for a
+    /// shorter interval is served this one, so that a client cannot make the server produce frames
+    /// at an arbitrary rate.
+    pub fn with_minimum_keepalive_interval(mut self, interval: Duration) -> Self {
+        self.minimum_keepalive_interval = interval;
+        self
+    }
+
+    /// The keepalive interval to serve a request asking for `requested`. Never shorter than the
+    /// configured minimum, so that a client cannot dictate the rate at which the server produces
+    /// frames.
+    fn keepalive_interval_for(&self, requested: Option<Duration>) -> Option<Duration> {
+        requested.map(|interval| cmp::max(interval, self.minimum_keepalive_interval))
+    }
+
     pub fn finish(self) -> RpcServer {
         let (request_tx, request_rx) = mpsc::channel(10);
         RpcServer {
@@ -211,23 +224,25 @@ impl Default for RpcServerBuilder {
             maximum_simultaneous_sessions: None,
             maximum_sessions_per_client: None,
             minimum_client_deadline: Duration::from_secs(1),
+            minimum_keepalive_interval: crate::DEFAULT_MINIMUM_KEEPALIVE_INTERVAL,
             handshake_timeout: Duration::from_secs(15),
         }
     }
 }
 
-pub(super) struct PeerRpcServer<TSvc> {
+pub(super) struct PeerRpcServer<TSvc, TSubstream> {
     executor: BoundedExecutor,
     config: RpcServerBuilder,
     service: TSvc,
-    protocol_notifications: Option<ProtocolNotificationRx<Substream>>,
+    protocol_notifications: Option<ProtocolNotificationRx<TSubstream>>,
     request_rx: mpsc::Receiver<RpcServerRequest>,
     sessions: HashMap<PeerId, usize>,
     tasks: FuturesUnordered<JoinHandle<PeerId>>,
 }
 
-impl<TSvc> PeerRpcServer<TSvc>
+impl<TSvc, TSubstream> PeerRpcServer<TSvc, TSubstream>
 where
+    TSubstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     TSvc: MakeService<
             StreamProtocol,
             Request<Bytes>,
@@ -243,7 +258,7 @@ where
     fn new(
         config: RpcServerBuilder,
         service: TSvc,
-        protocol_notifications: ProtocolNotificationRx<Substream>,
+        protocol_notifications: ProtocolNotificationRx<TSubstream>,
         request_rx: mpsc::Receiver<RpcServerRequest>,
     ) -> Self {
         Self {
@@ -336,7 +351,7 @@ where
 
     async fn handle_protocol_notification(
         &mut self,
-        notification: ProtocolNotification<Substream>,
+        notification: ProtocolNotification<TSubstream>,
     ) -> Result<(), RpcServerError> {
         match notification.event {
             ProtocolEvent::NewInboundSubstream { peer_id, substream } => {
@@ -398,7 +413,7 @@ where
         &mut self,
         protocol: StreamProtocol,
         peer_id: PeerId,
-        mut framed: CanonicalFraming<Substream>,
+        mut framed: CanonicalFraming<TSubstream>,
     ) -> Result<(), RpcServerError> {
         let mut handshake = Handshake::new(&mut framed).with_timeout(self.config.handshake_timeout);
 
@@ -477,24 +492,26 @@ where
     }
 }
 
-struct ActivePeerRpcService<TSvc> {
+struct ActivePeerRpcService<TSvc, TSubstream> {
     config: RpcServerBuilder,
     protocol: StreamProtocol,
     peer_id: PeerId,
     service: TSvc,
-    framed: EarlyClose<CanonicalFraming<Substream>>,
+    framed: EarlyClose<CanonicalFraming<TSubstream>>,
     logging_context_string: Arc<String>,
 }
 
-impl<TSvc> ActivePeerRpcService<TSvc>
-where TSvc: Service<Request<Bytes>, Response = Response<Body>, Error = RpcStatus>
+impl<TSvc, TSubstream> ActivePeerRpcService<TSvc, TSubstream>
+where
+    TSvc: Service<Request<Bytes>, Response = Response<Body>, Error = RpcStatus>,
+    TSubstream: AsyncRead + AsyncWrite + Unpin,
 {
     pub(self) fn new(
         config: RpcServerBuilder,
         protocol: StreamProtocol,
         node_id: PeerId,
         service: TSvc,
-        framed: CanonicalFraming<Substream>,
+        framed: CanonicalFraming<TSubstream>,
     ) -> Self {
         Self {
             logging_context_string: Arc::new(format!("peer: {}, protocol: {}", node_id, protocol)),
@@ -654,6 +671,8 @@ where TSvc: Service<Request<Bytes>, Response = Response<Body>, Error = RpcStatus
             method.id()
         );
 
+        let keepalive_interval = self.config.keepalive_interval_for(decoded_msg.keepalive_interval());
+
         let req = Request::new(method, decoded_msg.payload.into());
 
         let service_call = log_timing(
@@ -686,7 +705,8 @@ where TSvc: Service<Request<Bytes>, Response = Response<Body>, Error = RpcStatus
 
         match service_result {
             Ok(body) => {
-                self.process_body(request_id, deadline, body).await?;
+                self.process_body(request_id, deadline, keepalive_interval, body)
+                    .await?;
             },
             Err(err) => {
                 debug!(
@@ -713,10 +733,17 @@ where TSvc: Service<Request<Bytes>, Response = Response<Body>, Error = RpcStatus
         self.protocol.as_ref()
     }
 
+    /// Streams `body` back to the client.
+    ///
+    /// `deadline` bounds the gap between messages that actually carry the response: a stream that
+    /// produces nothing for that long is abandoned. When the client asked for keepalives, an empty
+    /// ACK frame goes out every `keepalive_interval` while that budget is running, so an idle stream
+    /// remains distinguishable from a dead peer without extending how long the server holds it.
     async fn process_body(
         &mut self,
         request_id: u32,
         deadline: Duration,
+        keepalive_interval: Option<Duration>,
         body: Response<Body>,
     ) -> Result<(), RpcServerError> {
         trace!(target: LOG_TARGET, "Service call succeeded");
@@ -740,12 +767,17 @@ where TSvc: Service<Request<Bytes>, Response = Response<Body>, Error = RpcStatus
             })
             .map(|resp| Bytes::from(resp.encode_to_vec()));
 
+        let mut deadline_at = Instant::now() + deadline;
+
         loop {
+            let idle_budget = deadline_at.saturating_duration_since(Instant::now());
+            let wait = keepalive_interval.map_or(idle_budget, |interval| cmp::min(interval, idle_budget));
+
             let next_item = log_timing(
                 self.logging_context_string.clone(),
                 request_id,
                 "message read",
-                time::timeout(deadline, stream.next()),
+                time::timeout(wait, stream.next()),
             );
 
             let result = next_item.await;
@@ -761,10 +793,21 @@ where TSvc: Service<Request<Bytes>, Response = Response<Body>, Error = RpcStatus
                     );
 
                     self.framed.send(msg).await?;
+                    deadline_at = Instant::now() + deadline;
                 },
                 Ok(None) => {
                     debug!(target: LOG_TARGET, "{} Request complete", self.logging_context_string,);
                     break;
+                },
+                Err(_) if keepalive_interval.is_some() && Instant::now() < deadline_at => {
+                    trace!(
+                        target: LOG_TARGET,
+                        "({}) Sending keepalive for request #{}", self.logging_context_string, request_id
+                    );
+                    let keepalive = Bytes::from(RpcResponse::keepalive(request_id).to_proto().encode_to_vec());
+                    #[cfg(feature = "metrics")]
+                    metrics::outbound_response_bytes(&self.peer_id, &self.protocol).observe(keepalive.len() as f64);
+                    self.framed.send(keepalive).await?;
                 },
                 Err(_) => {
                     debug!(
@@ -845,11 +888,14 @@ fn err_to_log_level(err: &io::Error) -> log::Level {
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::DuplexStream;
+    use tokio_util::compat::Compat;
+
     use super::*;
 
     #[tokio::test]
     async fn serve_drains_in_flight_sessions_before_returning() {
-        let (notify_tx, notify_rx) = mpsc::unbounded_channel();
+        let (notify_tx, notify_rx) = mpsc::unbounded_channel::<ProtocolNotification<Compat<DuplexStream>>>();
         let (_request_tx, request_rx) = mpsc::channel(1);
         let server = PeerRpcServer::new(RpcServerBuilder::new(), ProtocolServiceNotFound, notify_rx, request_rx);
 
@@ -870,5 +916,159 @@ mod tests {
         server.serve().await.unwrap();
 
         assert_eq!(Arc::strong_count(&session_resource), 1);
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use tokio::io::DuplexStream;
+    use tokio_util::compat::{Compat, TokioAsyncReadCompatExt};
+
+    use super::*;
+    use crate::not_found::NeverService;
+
+    type TestSubstream = Compat<DuplexStream>;
+
+    fn framed_pair() -> (CanonicalFraming<TestSubstream>, CanonicalFraming<TestSubstream>) {
+        let (server, client) = tokio::io::duplex(RPC_MAX_FRAME_SIZE);
+        (
+            framing::canonical(server.compat(), RPC_MAX_FRAME_SIZE),
+            framing::canonical(client.compat(), RPC_MAX_FRAME_SIZE),
+        )
+    }
+
+    fn session(framed: CanonicalFraming<TestSubstream>) -> ActivePeerRpcService<NeverService, TestSubstream> {
+        ActivePeerRpcService::new(
+            RpcServerBuilder::default(),
+            StreamProtocol::new("/test/keepalive/1.0"),
+            PeerId::random(),
+            NeverService,
+            framed,
+        )
+    }
+
+    /// A response body fed by the test, which stalls for as long as the test holds the sender
+    /// without sending.
+    fn body_fed_by(rx: mpsc::Receiver<Result<Bytes, RpcStatus>>) -> Response<Body> {
+        Response::new(Body::streaming(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })))
+    }
+
+    async fn collect_responses(framed: &mut CanonicalFraming<TestSubstream>) -> Vec<proto::RpcResponse> {
+        let mut responses = Vec::new();
+        while let Some(frame) = framed.next().await {
+            responses.push(proto::RpcResponse::decode(frame.unwrap().freeze()).unwrap());
+        }
+        responses
+    }
+
+    #[tokio::test]
+    async fn keepalives_hold_an_idle_stream_open_until_its_deadline() {
+        let (server_framed, mut client_framed) = framed_pair();
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Ok(Bytes::from_static(b"first"))).await.unwrap();
+
+        let mut service = session(server_framed);
+        let started = Instant::now();
+        let server = tokio::spawn(async move {
+            service
+                .process_body(
+                    1,
+                    Duration::from_millis(400),
+                    Some(Duration::from_millis(50)),
+                    body_fed_by(rx),
+                )
+                .await
+                .unwrap();
+        });
+
+        let responses = collect_responses(&mut client_framed).await;
+        server.await.unwrap();
+        // The stream is only abandoned once the deadline is up, not at the first idle interval.
+        assert!(started.elapsed() >= Duration::from_millis(400));
+
+        let (keepalives, messages): (Vec<_>, Vec<_>) = responses.iter().partition(|r| r.is_keepalive());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].payload, b"first");
+        assert!(
+            keepalives.len() >= 3,
+            "expected several keepalives, got {}",
+            keepalives.len()
+        );
+        assert!(keepalives.iter().all(|r| r.payload.is_empty() && r.request_id == 1));
+
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn an_idle_stream_ends_at_its_deadline_when_no_keepalives_are_asked_for() {
+        let (server_framed, mut client_framed) = framed_pair();
+        let (tx, rx) = mpsc::channel(1);
+        tx.send(Ok(Bytes::from_static(b"first"))).await.unwrap();
+
+        let mut service = session(server_framed);
+        let server = tokio::spawn(async move {
+            service
+                .process_body(1, Duration::from_millis(150), None, body_fed_by(rx))
+                .await
+                .unwrap();
+        });
+
+        let responses = collect_responses(&mut client_framed).await;
+        server.await.unwrap();
+
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].payload, b"first");
+
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_message_renews_the_deadline() {
+        let (server_framed, mut client_framed) = framed_pair();
+        let (tx, rx) = mpsc::channel(1);
+
+        let mut service = session(server_framed);
+        let server = tokio::spawn(async move {
+            service
+                .process_body(
+                    1,
+                    Duration::from_millis(600),
+                    Some(Duration::from_millis(50)),
+                    body_fed_by(rx),
+                )
+                .await
+                .unwrap();
+        });
+
+        let feeder = tokio::spawn(async move {
+            for _ in 0..4 {
+                time::sleep(Duration::from_millis(100)).await;
+                tx.send(Ok(Bytes::from_static(b"tick"))).await.unwrap();
+            }
+            // Holding the sender past the last message lets the deadline expire and end the stream.
+            time::sleep(Duration::from_millis(900)).await;
+        });
+
+        let responses = collect_responses(&mut client_framed).await;
+        server.await.unwrap();
+        feeder.await.unwrap();
+
+        assert_eq!(responses.iter().filter(|r| !r.is_keepalive()).count(), 4);
+    }
+
+    #[test]
+    fn a_keepalive_interval_below_the_minimum_is_raised_to_it() {
+        let config = RpcServerBuilder::new().with_minimum_keepalive_interval(Duration::from_secs(10));
+        assert_eq!(config.keepalive_interval_for(None), None);
+        assert_eq!(
+            config.keepalive_interval_for(Some(Duration::from_secs(1))),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            config.keepalive_interval_for(Some(Duration::from_secs(30))),
+            Some(Duration::from_secs(30))
+        );
     }
 }

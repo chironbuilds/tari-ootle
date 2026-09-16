@@ -32,6 +32,7 @@ use tari_common::{
     configuration::{CommonConfig, serializers},
 };
 use tari_crypto::ristretto::RistrettoPublicKey;
+use tari_indexer_lib::cached_substate_manager::DEFAULT_NEGATIVE_CACHE_TTL;
 use tari_ootle_app_utilities::{
     epoch_oracle_config::EpochOracleConfig,
     p2p_config::{P2pConfig, PeerSeedsConfig},
@@ -82,6 +83,21 @@ impl ApplicationConfig {
         self.to_data_dir().join("state.db")
     }
 
+    /// The configured consensus constants file, resolved against the data directory.
+    pub fn localnet_consensus_constants_path(&self) -> Option<PathBuf> {
+        let path = self.indexer.localnet_consensus_constants_file.as_ref()?;
+        if path.is_absolute() {
+            return Some(path.clone());
+        }
+
+        Some(self.to_data_dir().join(path))
+    }
+
+    /// Where a consensus constants file is picked up from when none is configured.
+    pub fn default_localnet_consensus_constants_path(&self) -> PathBuf {
+        self.to_data_dir().join("consensus_constants.toml")
+    }
+
     pub fn global_db_path(&self) -> PathBuf {
         self.to_data_dir().join("global_storage.sqlite")
     }
@@ -96,6 +112,12 @@ pub struct IndexerConfig {
     pub identity_file: PathBuf,
     /// The relative path to store persistent data
     pub data_dir: PathBuf,
+    /// An absolute or relative (to data_dir) path to a file of consensus constant overrides, read
+    /// once at startup and only on LocalNet. Setting it says the file is expected, so an indexer that
+    /// cannot find it refuses to start. Leave it unset to pick up
+    /// `<data_dir>/consensus_constants.toml` if it happens to be there.
+    #[serde(default)]
+    pub localnet_consensus_constants_file: Option<PathBuf>,
     /// The p2p configuration settings
     pub p2p: P2pConfig,
     /// Listening address for the indexer API server
@@ -117,8 +139,25 @@ pub struct IndexerConfig {
     /// How often do we want to scan the second layer for new versions
     #[serde(with = "serializers::seconds")]
     pub block_scanning_interval: Duration,
+    /// How long a shard group waits before reopening its state sync stream after the stream fails,
+    /// or after a validator that does not follow its tip closes it. Also how often sync statistics
+    /// are reported.
     #[serde(with = "serializers::seconds")]
     pub state_scanning_interval: Duration,
+    /// The longest a validator holds a state sync stream open without a transition to send. The
+    /// stream stays open past the validator's tip, streaming transitions as they commit, and is
+    /// reopened once this passes at the cost of one completion marker per shard. While it is open
+    /// and quiet the validator's keepalives are what show it is still there, so this only sets how
+    /// often a quiet stream is reopened.
+    #[serde(default = "default_state_sync_stream_deadline", with = "serializers::seconds")]
+    pub state_sync_stream_deadline: Duration,
+    /// How often a validator is asked to show it is still there while the state sync stream has
+    /// nothing to send. Each keepalive re-confirms every shard the stream has caught up, which is
+    /// what keeps the substate cache serving a quiet shard. Must be well under
+    /// `state_sync_stream_deadline`. A validator serves no shorter an interval than its own minimum
+    /// (5s by default), and the stream is given up after several missed keepalives.
+    #[serde(default = "default_state_sync_keepalive_interval", with = "serializers::seconds")]
+    pub state_sync_keepalive_interval: Duration,
     /// The sidechain to listen on. Also identifies this chain for L1 burn-claim binding.
     pub sidechain_id: Option<RistrettoPublicKey>,
     /// Cache TTL for substates fetched during dry run transaction processing.
@@ -135,17 +174,36 @@ pub struct IndexerConfig {
     /// could supersede or destroy it has already reached this indexer through that shard's transition
     /// stream, which only holds while the stream is being kept up with.
     ///
-    /// It must comfortably exceed a full sync round - `state_scanning_interval` plus however long it
-    /// takes to sync every shard group - or the cache closes between rounds and every read costs a
-    /// validator round trip. It is also the only bound on a validator that has stopped serving
-    /// transitions: until it expires, values that the withheld transitions would have retracted are
-    /// still served. Ordinary staleness is bounded by the sync round, not by this.
+    /// A shard that sees no transition is re-confirmed by each keepalive on its stream, every
+    /// `state_sync_keepalive_interval`. A validator that goes quiet is given up on after several
+    /// missed keepalives and the stream reopened from another, which takes a minute or two, so this
+    /// must comfortably exceed that or the cache closes for every shard of a group whose validator
+    /// went away. It is also the only bound on a validator that has stopped serving transitions:
+    /// until it expires, values that the withheld transitions would have retracted are still
+    /// served. Ordinary staleness is bounded by how promptly the validator streams its commits,
+    /// not by this.
     #[serde(default = "default_substate_cache_max_serve_lag", with = "serializers::seconds")]
     pub substate_cache_max_serve_lag: Duration,
     /// Maximum substates held in the cache - one entry each, its head version. Beyond this the oldest
     /// are evicted, at the cost of one validator round trip each to fetch again.
     #[serde(default = "default_substate_cache_max_entries")]
     pub substate_cache_max_entries: usize,
+    /// How long the cache serves a substate it has established does not exist. A creation retracts
+    /// that through the transition stream, so ordinary staleness is bounded by the sync round and
+    /// this covers only what that stream cannot correct.
+    ///
+    /// What it cannot correct is an answer that was already wrong when it was cached. The committee
+    /// is chosen from the epoch manager's current epoch, independently of the watermark that gates
+    /// the write, so a lagging view of a shard group split can put the question to a committee that
+    /// honestly no longer holds the substate and agrees it does not exist. Uncached that misleads
+    /// one caller; cached it is served to every caller until this expires.
+    ///
+    /// Held shorter than the other entries because it is the one a caller feels as an absence: a
+    /// substate being waited on stays missing until this expires. Lowering it towards zero narrows
+    /// that window to sub-second - an entry cached within the current second still answers - at
+    /// `f + 1` committee round trips for every nonexistent lookup.
+    #[serde(default = "default_substate_cache_negative_ttl", with = "serializers::seconds")]
+    pub substate_cache_negative_ttl: Duration,
     /// How many epochs past its terminal epoch a stored transaction is retained before it is pruned.
     /// A transaction's terminal epoch is the epoch it committed in once its receipt has been
     /// indexed, and its `max_epoch` — the last epoch it could still be sequenced in — until then, so
@@ -213,12 +271,24 @@ fn default_verify_substate_proofs() -> bool {
     true
 }
 
+fn default_state_sync_stream_deadline() -> Duration {
+    Duration::from_secs(600)
+}
+
+fn default_state_sync_keepalive_interval() -> Duration {
+    Duration::from_secs(10)
+}
+
 fn default_substate_cache_max_serve_lag() -> Duration {
     Duration::from_secs(300)
 }
 
 fn default_substate_cache_max_entries() -> usize {
     100_000
+}
+
+fn default_substate_cache_negative_ttl() -> Duration {
+    DEFAULT_NEGATIVE_CACHE_TTL
 }
 
 /// The subset of an indexer's configuration that is published over its API, as it affects what
@@ -348,6 +418,7 @@ impl Default for IndexerConfig {
             override_from: None,
             identity_file: PathBuf::from("indexer_id.json"),
             data_dir: PathBuf::from("data/indexer"),
+            localnet_consensus_constants_file: None,
             p2p: P2pConfig::default(),
             api_listen_address: Some("127.0.0.1:18300".parse().unwrap()),
             metrics_listen_address: Some("127.0.0.1:18302".parse().unwrap()),
@@ -357,11 +428,14 @@ impl Default for IndexerConfig {
             web_ui_public_graphql_url: None,
             block_scanning_interval: Duration::from_secs(10),
             state_scanning_interval: Duration::from_secs(60),
+            state_sync_stream_deadline: default_state_sync_stream_deadline(),
+            state_sync_keepalive_interval: default_state_sync_keepalive_interval(),
             sidechain_id: None,
             dry_run_cache_ttl: Duration::from_secs(10),
             allow_past_protocol_activation: false,
             substate_cache_max_serve_lag: default_substate_cache_max_serve_lag(),
             substate_cache_max_entries: default_substate_cache_max_entries(),
+            substate_cache_negative_ttl: default_substate_cache_negative_ttl(),
             transaction_retention_epochs: default_transaction_retention_epochs(),
             index_gossiped_transactions: default_index_gossiped_transactions(),
             max_transaction_gossip_queue_bytes: default_max_transaction_gossip_queue_bytes(),

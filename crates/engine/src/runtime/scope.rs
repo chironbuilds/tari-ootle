@@ -14,11 +14,7 @@ use tari_template_lib::{
     },
 };
 
-use crate::runtime::{
-    AuthorizationScope,
-    RuntimeError,
-    locking::{LockError, LockedSubstate},
-};
+use crate::runtime::{AuthorizationScope, RuntimeError, locking::LockedSubstate};
 
 #[derive(Debug, Clone)]
 pub struct CallScope {
@@ -38,6 +34,10 @@ pub struct CallScope {
     /// unconsumed, and the caller keeps them once the frame is popped.
     inherited_buckets: IndexSet<BucketId>,
     inherited_proofs: IndexSet<ProofId>,
+    /// Proofs seeded from the transaction's base scope so that the callee's access rule can be evaluated against
+    /// the caller at the call boundary. [`Self::revoke_boundary_proofs`] takes them away again once that check has
+    /// run, leaving the frame to act with its own badges and the proofs it was handed as arguments.
+    boundary_proofs: IndexSet<ProofId>,
     component_lock: Option<LockedSubstate>,
     lock_scope: IndexSet<LockId>,
     bucket_scope: IndexSet<BucketId>,
@@ -56,6 +56,7 @@ impl CallScope {
             proof_scope: IndexSet::new(),
             inherited_buckets: IndexSet::new(),
             inherited_proofs: IndexSet::new(),
+            boundary_proofs: IndexSet::new(),
             component_lock: None,
             lock_scope: IndexSet::new(),
             bucket_scope: IndexSet::new(),
@@ -71,15 +72,34 @@ impl CallScope {
     }
 
     /// Installs the auth scope this frame starts with. Its proofs came from the frame's caller (the transaction's
-    /// base scope for a top-level instruction), so the caller accounts for them.
-    pub(crate) fn set_auth_scope(&mut self, scope: AuthorizationScope) {
+    /// base scope for a top-level instruction), so the caller accounts for them. They last until the boundary
+    /// check has run — see [`Self::revoke_boundary_proofs`]. Proofs already in scope arrived as call arguments and
+    /// authorize for the whole frame, so they are carried into `scope`.
+    pub(crate) fn set_auth_scope(&mut self, mut scope: AuthorizationScope) {
+        let argument_proofs = self.auth_scope.proofs().clone();
+        self.boundary_proofs = scope
+            .proofs()
+            .iter()
+            .filter(|id| !argument_proofs.contains(*id))
+            .copied()
+            .collect();
+        for proof_id in &argument_proofs {
+            scope.add_proof(*proof_id);
+        }
         self.inherited_proofs.extend(scope.proofs().iter().copied());
         self.proof_scope.extend(scope.proofs().iter().copied());
         self.auth_scope = scope;
     }
 
-    pub fn is_lock_in_scope(&self, lock_id: LockId) -> bool {
-        self.lock_scope.contains(&lock_id)
+    /// Drops the proofs that were in scope only for the call boundary check. The frame keeps its badges and its
+    /// `Proof` arguments, so a component reached by a top-level instruction can act on a guarded resource only with
+    /// a proof its caller handed it.
+    pub(crate) fn revoke_boundary_proofs(&mut self) {
+        for proof_id in std::mem::take(&mut self.boundary_proofs) {
+            self.proof_scope.swap_remove(&proof_id);
+            self.inherited_proofs.swap_remove(&proof_id);
+            self.auth_scope.remove_proof(&proof_id);
+        }
     }
 
     pub fn lock_scope(&self) -> &IndexSet<LockId> {
@@ -153,11 +173,11 @@ impl CallScope {
         self.auth_scope.remove_proof(proof_id);
     }
 
-    pub fn remove_lock_from_scope(&mut self, lock_id: LockId) -> Result<(), RuntimeError> {
-        if !self.lock_scope.swap_remove(&lock_id) {
-            return Err(RuntimeError::LockError(LockError::LockIdNotFound { lock_id }));
-        }
-        Ok(())
+    /// Releases `lock_id` from this frame, reporting whether the frame held it. A frame may release a lock its
+    /// caller took — a component lock is taken by the caller and released when the frame it was pushed into is
+    /// popped — so the caller of this searches the frame stack rather than assuming the current frame.
+    pub fn remove_lock_from_scope(&mut self, lock_id: LockId) -> bool {
+        self.lock_scope.swap_remove(&lock_id)
     }
 
     pub fn get_current_component_lock(&self) -> Option<&LockedSubstate> {
@@ -238,14 +258,8 @@ impl CallScope {
         self.referenced.insert(address);
     }
 
-    pub fn update_from_parent(&mut self, _parent: &CallScope) {
-        // Nothing to do? We bring things into scope via the args so that is why we don't need to move things across
-        // here.
-
-        // self.owned.extend(_parent.owned.iter().cloned());
-        // for proof in _parent.auth_scope.proofs() {
-        //     self.auth_scope.add_proof(*proof);
-        // }
+    pub fn remove_substate_from_referenced(&mut self, address: &SubstateId) -> bool {
+        self.referenced.swap_remove(address)
     }
 
     /// Merges what a completed child frame hands back into this scope. Only substates the child created and still
@@ -301,17 +315,21 @@ impl CallScope {
     pub fn include_owned_in_scope(&mut self, values: &IndexedWellKnownTypes) {
         for addr in values.referenced_substates() {
             // These are never able to bring these into scope
-            if addr.is_public_key_identity() || addr.is_transaction_receipt() || addr.is_template() {
+            if addr.is_virtual() || addr.is_transaction_receipt() || addr.is_template() {
                 continue;
             }
             self.component_owned.insert(addr);
         }
     }
 
+    /// Brings what a caller passed in as arguments into this frame. Buckets and proofs stay the caller's — they are
+    /// recorded as inherited, so this frame need not account for them — but a proof among them also *authorizes*
+    /// here from the moment it arrives, without the frame calling `authorize()` on it. Passing a proof is therefore
+    /// the act of lending the authority it carries.
     pub fn include_refs_in_scope(&mut self, values: &IndexedWellKnownTypes) {
         for addr in values.referenced_substates() {
             // Never able to bring these into scope
-            if addr.is_public_key_identity() || addr.is_vault() || addr.is_read_only() {
+            if addr.is_virtual() || addr.is_vault() || addr.is_read_only() {
                 continue;
             }
             self.add_substate_to_referenced(addr);
@@ -397,6 +415,22 @@ impl Display for CallScope {
     }
 }
 
+/// How much of the ledger a call frame may mutate. Ordered from least to most restrictive so that a child frame
+/// can never be less restricted than its parent (`FrameWriteMode::max`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FrameWriteMode {
+    /// Any substate the frame can lock may be written.
+    Full,
+    /// Only the component the frame is executing on, through the lock taken at push. Every write lock the frame
+    /// asks for and every new substate it creates is rejected, so it cannot touch a vault, resource or any other
+    /// component. Resource auth hooks run in this mode: the acting component did not choose the hook code, so the
+    /// hook must not be able to act on the acting component's behalf beyond its own state.
+    OwnComponent,
+    /// No state mutation at all. Spend-script predicate frames run in this mode so they are provably
+    /// side-effect-free.
+    ReadOnly,
+}
+
 #[derive(Debug, Clone)]
 pub struct CallFrame {
     scope: CallScope,
@@ -405,10 +439,7 @@ pub struct CallFrame {
     entity_id: EntityId,
     allow_cross_template_calls: bool,
     allow_migration_calls: bool,
-    /// When set, every state mutation funnelling through `WorkingState::write_lock_substate` /
-    /// `new_substate` is rejected with `RuntimeError::WriteInReadOnlyContext`. Set for spend-script
-    /// predicate frames so they are provably side-effect-free.
-    read_only: bool,
+    write_mode: FrameWriteMode,
 }
 
 impl CallFrame {
@@ -420,7 +451,7 @@ impl CallFrame {
             entity_id,
             allow_cross_template_calls: true,
             allow_migration_calls: false,
-            read_only: false,
+            write_mode: FrameWriteMode::Full,
         }
     }
 
@@ -437,7 +468,7 @@ impl CallFrame {
             entity_id,
             allow_cross_template_calls: true,
             allow_migration_calls: false,
-            read_only: false,
+            write_mode: FrameWriteMode::Full,
         }
     }
 
@@ -454,7 +485,7 @@ impl CallFrame {
             entity_id,
             allow_cross_template_calls: false,
             allow_migration_calls: true,
-            read_only: false,
+            write_mode: FrameWriteMode::Full,
         }
     }
 
@@ -494,21 +525,30 @@ impl CallFrame {
         self.allow_migration_calls
     }
 
-    pub fn is_read_only(&self) -> bool {
-        self.read_only
+    pub fn write_mode(&self) -> FrameWriteMode {
+        self.write_mode
     }
 
-    /// Restricts this frame to a read-only, non-cross-template sandbox, as used for spend-script
-    /// predicate evaluation. The two restrictions are load-bearing in tandem: read-only blocks every
-    /// state write at the lock layer, while disabling cross-template calls prevents the predicate
-    /// from re-entering other templates.
-    pub fn restrict_to_read_only(&mut self) {
-        self.read_only = true;
+    /// Restricts this frame to `mode` (never loosening an existing restriction) and disables cross-template
+    /// calls. The two restrictions are load-bearing in tandem: the write mode blocks state writes at the lock
+    /// layer, while disabling cross-template calls prevents the frame from re-entering other templates, which
+    /// would otherwise run with the identity of this frame as their caller.
+    pub fn restrict(&mut self, mode: FrameWriteMode) {
+        self.write_mode = self.write_mode.max(mode);
         self.allow_cross_template_calls = false;
+    }
+
+    /// A frame is never less restricted than the frame that pushed it: a sandboxed frame must not be able to
+    /// escape its sandbox by calling into a frame that would then write on its behalf.
+    pub fn inherit_restrictions(&mut self, parent: &CallFrame) {
+        self.write_mode = self.write_mode.max(parent.write_mode);
+        if !parent.allow_cross_template_calls {
+            self.allow_cross_template_calls = false;
+        }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum PushCallFrame {
     ForComponent {
         template_address: TemplateAddress,

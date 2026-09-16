@@ -232,6 +232,11 @@ impl ConfidentialResourceBuilder {
     /// The resource will fail to build if the component's template does not have a method with the correct signature.
     /// Hooks are only run when the resource is acted on by an external component.
     ///
+    /// The hook runs in a sandboxed frame: it may read, emit events and (when declared `&mut self`) update its own
+    /// component state, but it cannot write any other substate, act on any vault or resource, or call another
+    /// component. The acting component's caller badges are in scope for the hook's own method rule, and the sandbox
+    /// is what stops the hook spending them on the acting component's behalf.
+    ///
     /// ## Examples
     ///
     /// Building a resource with a hook from within a component
@@ -262,6 +267,27 @@ impl ConfidentialResourceBuilder {
                 .try_into()
                 .unwrap_or_else(|_| panic!("{}", ERR_AUTH_HOOK_FN_NAME_LEN)),
         ));
+        self
+    }
+
+    /// Sets up who can install, replace or remove the resource's authorization hook after creation.
+    ///
+    /// A hook is [`LOCKED`](tari_template_lib_types::access_rules::LOCKED) by default: it binds for the life of
+    /// the resource, and a hook that panics or denies unconditionally leaves every vault of the resource
+    /// unspendable. Setting an updater buys the ability to repair or retire the hook, at the cost of letting
+    /// whoever satisfies the updater change the rules that existing holders are relying on.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// use tari_template_lib::{caller_context::CallerContext, prelude::{OWNER, ResourceBuilder}};
+    /// ResourceBuilder::confidential()
+    ///     .with_authorization_hook(CallerContext::current_component_address(), "my_hook")
+    ///     .with_authorization_hook_updater(OWNER)
+    ///     .build();
+    /// ```
+    pub fn with_authorization_hook_updater<U: Into<UpdateRule>>(mut self, updater: U) -> Self {
+        self.access_rules = self.access_rules.set_auth_hook_updater(updater);
         self
     }
 

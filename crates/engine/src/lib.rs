@@ -1,8 +1,10 @@
 // Copyright 2022 The Tari Project
 // SPDX-License-Identifier: BSD-3-Clause
 
+pub mod abi_metrics;
 pub mod executables;
 pub mod fees;
+pub mod intrinsics;
 pub mod runtime;
 pub mod state_store;
 pub mod template;

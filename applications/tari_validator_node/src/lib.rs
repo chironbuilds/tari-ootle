@@ -34,22 +34,28 @@ mod http_ui;
 #[cfg(feature = "metrics")]
 mod inbound_queue_metrics;
 mod json_rpc;
+mod memory_budget;
 #[cfg(feature = "metrics")]
 mod metrics;
 mod migrations;
 pub mod node;
 mod p2p;
+#[cfg(feature = "metrics")]
+mod state_store_metrics;
 
 use std::{fs, io, iter, process, time::Instant};
 
 use log::*;
 use serde::{Deserialize, Serialize};
 use tari_common::exit_codes::{ExitCode, ExitError};
-use tari_consensus::consensus_constants::ConsensusConstants;
 use tari_engine_types::crypto::{MAX_LAZY_BP_AGG_FACTORS, get_commitment_factory, get_static_range_proof_service};
 use tari_epoch_manager::traits::EpochManagerSpec;
 use tari_epoch_oracles::EpochOracle;
-use tari_ootle_app_utilities::{keypair::RistrettoKeypair, protocol_activation::check_and_record_activation_schedule};
+use tari_ootle_app_utilities::{
+    consensus_constants_file::load_consensus_constants,
+    keypair::RistrettoKeypair,
+    protocol_activation::check_and_record_activation_schedule,
+};
 use tari_ootle_common_types::SubstateAddress;
 use tari_ootle_p2p::PeerAddress;
 use tari_ootle_storage::global::{DbFactory, GlobalDb};
@@ -61,7 +67,6 @@ pub use crate::config::{ApplicationConfig, ValidatorNodeConfig};
 use crate::{
     bootstrap::{Services, spawn_services},
     consensus::spec::ValidatorNodeStateStore,
-    file_l1_submitter::FileLayerOneSubmitter,
     json_rpc::{JsonRpcHandlers, spawn_json_rpc},
     node::ValidatorNode,
 };
@@ -127,7 +132,11 @@ pub async fn run_validator_node(
     #[cfg(feature = "metrics")]
     let metrics_registry = create_metrics_registry(keypair.public_key(), &mut base_registry);
 
-    let consensus_constants = ConsensusConstants::from(config.network);
+    let consensus_constants = load_consensus_constants(
+        config.network,
+        config.validator_node.localnet_consensus_constants_file.as_deref(),
+        &config.validator_node.default_localnet_consensus_constants_file(),
+    )?;
     let mut services = spawn_services(
         config.clone(),
         shutdown.to_signal(),
@@ -241,7 +250,6 @@ impl EpochManagerSpec for ValidatorNodeEpochManagerSpec {
     #[cfg(feature = "metrics")]
     type EpochEventOracle =
         crate::epoch_metrics::MeteredEpochOracle<EpochOracle<GlobalDb<SqliteGlobalDbAdapter<PeerAddress>>>>;
-    type LayerOneSubmitter = FileLayerOneSubmitter;
 }
 
 #[cfg(test)]

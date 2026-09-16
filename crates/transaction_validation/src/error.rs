@@ -1,6 +1,7 @@
 //    Copyright 2024 The Tari Project
 //    SPDX-License-Identifier: BSD-3-Clause
 
+use tari_engine_types::substate::SubstateId;
 use tari_networking::NetworkingError;
 use tari_ootle_common_types::Epoch;
 use tari_ootle_storage::{StorageError, consensus_models::TransactionPoolError};
@@ -55,6 +56,15 @@ pub enum TransactionValidationError {
     NetworkMismatch { actual: Network, expected: Network },
     #[error("Transaction {transaction_id} contains a pay fee instruction, which is not allowed")]
     ContainsPayFeeInstruction { transaction_id: TransactionId },
+    #[error(
+        "Transaction {transaction_id} declares reserved substate {substate_id} as an input. Public-key identities, \
+         caller badges and the resources those badges belong to are issued or reserved by the engine and never \
+         stored, so no version of one can be locked."
+    )]
+    ReservedSubstateInput {
+        transaction_id: TransactionId,
+        substate_id: SubstateId,
+    },
     #[error("Dry run transactions are not allowed")]
     DryRunNotAllowed,
     #[error("Transaction {transaction_id} weight {weight} exceeds the maximum allowed weight {max_weight}")]
@@ -62,6 +72,12 @@ pub enum TransactionValidationError {
         transaction_id: TransactionId,
         weight: u64,
         max_weight: u64,
+    },
+    #[error("Transaction {transaction_id} is {size} bytes, exceeding the maximum allowed {max_size}")]
+    TransactionExceedsMaxSize {
+        transaction_id: TransactionId,
+        size: usize,
+        max_size: usize,
     },
     #[error("Transaction {transaction_id} exceeds the per-transaction stealth {limit} cap: max {max}, got {actual}")]
     ExceedsStealthTransactionLimit {
@@ -75,6 +91,14 @@ pub enum TransactionValidationError {
          {max}"
     )]
     TooManyPublishTemplateInstructions {
+        transaction_id: TransactionId,
+        max: usize,
+        actual: usize,
+    },
+    #[error("Transaction {transaction_id} publishes a template in its fee instructions")]
+    PublishTemplateInFeeInstructions { transaction_id: TransactionId },
+    #[error("Transaction {transaction_id} publishes a {actual} byte template binary, but the maximum allowed is {max}")]
+    PublishTemplateBinaryTooLarge {
         transaction_id: TransactionId,
         max: usize,
         actual: usize,
@@ -149,10 +173,14 @@ impl TransactionValidationError {
             Self::UnknownNetwork { .. } |
             Self::NetworkMismatch { .. } |
             Self::ContainsPayFeeInstruction { .. } |
+            Self::ReservedSubstateInput { .. } |
             Self::DryRunNotAllowed |
             Self::TransactionExceedsMaxWeight { .. } |
+            Self::TransactionExceedsMaxSize { .. } |
             Self::ExceedsStealthTransactionLimit { .. } |
             Self::TooManyPublishTemplateInstructions { .. } |
+            Self::PublishTemplateInFeeInstructions { .. } |
+            Self::PublishTemplateBinaryTooLarge { .. } |
             Self::TooManySignatures { .. } |
             Self::InvalidBlobReferences { .. } => true,
         }

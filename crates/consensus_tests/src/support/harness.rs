@@ -45,7 +45,11 @@ use tari_state_store_rocksdb::column_families::{
     finalized_transaction::FinalizedTransactionLinkCf,
     transaction::TransactionCf,
 };
-use tokio::{sync::broadcast, task, time::sleep};
+use tokio::{
+    sync::broadcast,
+    task,
+    time::{Instant, sleep},
+};
 
 use super::{
     MessageFilter,
@@ -261,9 +265,12 @@ impl Test {
     }
 
     pub async fn on_block_committed(&mut self) -> (TestAddress, BlockId, Epoch, NodeHeight) {
+        // The deadline is a wall-clock bound on the wait for a committed block. Events that are ignored below
+        // must not extend it, otherwise a consensus livelock that keeps emitting events never trips the timeout.
+        let deadline = self.timeout.map(|timeout| Instant::now() + timeout);
         loop {
-            let (address, event) = if let Some(timeout) = self.timeout {
-                match tokio::time::timeout(timeout, self.on_hotstuff_event()).await {
+            let (address, event) = if let Some(deadline) = deadline {
+                match tokio::time::timeout_at(deadline, self.on_hotstuff_event()).await {
                     Ok(v) => v,
                     Err(_) => {
                         self.dump_pool_info();
@@ -511,6 +518,18 @@ impl Test {
         .await
     }
 
+    /// Waits until every validator in `dest` has received the transaction. Unlike waiting on a pool count,
+    /// this cannot be raced by the transaction being proposed and finalized between two polls.
+    pub async fn wait_for_transaction_seen(&self, dest: TestVnDestination, tx_id: &TransactionId) {
+        self.wait_all_for_predicate(format!("transaction {tx_id} seen"), |vn| {
+            if !dest.is_for_vn(vn) {
+                return true;
+            }
+            vn.has_seen_transaction(tx_id)
+        })
+        .await
+    }
+
     pub fn with_all_validators(&self, f: impl FnMut(&Validator)) {
         self.validators.values().for_each(f);
     }
@@ -671,7 +690,6 @@ impl TestBuilder {
                     num_preshards: TEST_NUM_PRESHARDS,
                     pacemaker_block_time: DEFAULT_PACEMAKER_BLOCK_TIME,
                     missed_proposal_suspend_threshold: 5,
-                    missed_proposal_evict_threshold: 10,
                     missed_proposal_recovery_threshold: 5,
                     max_transaction_validity_epochs: 100,
                     // Keep the weight budget effectively unbounded in tests so behaviour stays
@@ -683,6 +701,9 @@ impl TestBuilder {
                     max_block_validation_weight: u64::MAX,
                     // Per-transaction mempool weight cap; effectively unbounded in tests.
                     max_transaction_weight: u64::MAX,
+                    // Per-transaction byte cap; likewise unbounded, so tests are shaped by the
+                    // behaviour they exercise rather than by transaction size.
+                    max_transaction_size_bytes: usize::MAX,
                     // Network-default wasm budgets. Fabricated executions consume
                     // TEST_WASM_EXECUTION_POINTS each, sized so normal test transactions can never
                     // hit the budget (asserted in `start`). Tests exercising excessive computation
@@ -690,11 +711,9 @@ impl TestBuilder {
                     max_block_execution_points: 4_500_000_000,
                     max_block_validation_execution_points: 5_000_000_000,
                     exhaust_burn_rate: ExhaustBurnRate::new(500),
-                    epoch_end_spread_blocks: 0,
                 },
                 state_tree_cleanup_interval: Duration::from_secs(1000),
                 epoch_gc_interval: Duration::from_secs(1000),
-                enable_eviction_proposal: true,
                 epoch_end_grace_period: Duration::from_secs(1),
                 catch_up_request_timeout: Duration::from_secs(15),
             },
@@ -740,11 +759,6 @@ impl TestBuilder {
                 vote_power: VotePower::of(1),
             });
         }
-        self
-    }
-
-    pub fn add_failure_node<T: Into<TestAddress>>(mut self, node: T) -> Self {
-        self.failure_nodes.push(node.into());
         self
     }
 

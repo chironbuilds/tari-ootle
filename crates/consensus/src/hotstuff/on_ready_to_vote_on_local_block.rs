@@ -33,7 +33,6 @@ use tari_ootle_storage::{
         TransactionPoolStage,
         TransactionRecord,
         ValidBlock,
-        ValidatorConsensusStats,
         ValidatorStatsUpdate,
     },
 };
@@ -154,18 +153,15 @@ where TConsensusSpec: ConsensusSpec
         // Process newly justified block
         let mut justified_block = Block::get_justified_block(&**tx, valid_block.justify(), valid_block.epoch())?;
         // This comes before decide so that all evidence can be in place before LocalPrepare and LocalAccept
-        if !justified_block.has_justify_qc() {
-            // We need to process this before to ensure that we have the latest state when checking the new block
-            let processed_blocks =
-                process_newly_justified_block(&**tx, &justified_block, block_qc_id, local_committee_info, change_set)?;
-            for mut block in processed_blocks {
-                block.add_justify_qc(tx, &block_qc_id)?;
-            }
-            justified_block.add_justify_qc(tx, &block_qc_id)?;
-            // Even if we do not yet see the next epoch (e.g. race condition), if a majority have, we allow the
-            // epoch end to be proposed.
-            can_propose_epoch_end |= justified_block.is_epoch_end();
+        let processed_blocks =
+            process_newly_justified_block(&**tx, &justified_block, block_qc_id, local_committee_info, change_set)?;
+        for mut block in processed_blocks {
+            block.add_justify_qc(tx, &block_qc_id)?;
         }
+        justified_block.add_justify_qc(tx, &block_qc_id)?;
+        // Even if we do not yet see the next epoch (e.g. race condition), if a majority have, we allow the
+        // epoch end to be proposed.
+        can_propose_epoch_end |= justified_block.is_epoch_end();
 
         if self.should_vote(&**tx, valid_block.block())? {
             let parent = valid_block.block().get_parent(&**tx)?;
@@ -372,52 +368,6 @@ where TConsensusSpec: ConsensusSpec
                     }
 
                     continue;
-                },
-                Command::EvictNode(atom) => {
-                    if ValidatorConsensusStats::is_node_evicted(tx, block.id(), &atom.public_key)? {
-                        warn!(
-                            target: LOG_TARGET,
-                            "❌ NO VOTE: {}", NoVoteReason::NodeAlreadyEvicted
-                        );
-
-                        proposed_block_change_set.set_no_vote(NoVoteReason::NodeAlreadyEvicted);
-                        return Ok(());
-                    }
-
-                    let num_evicted = ValidatorConsensusStats::count_number_evicted_nodes(tx, block.epoch())?;
-                    // TODO: technically, we should not evict more than 1/3 of the voting power, not the number of nodes
-                    // (but this is currently the same thing)
-                    let max_allowed_to_evict = u64::from(local_committee_info.max_failure_shard_group_members())
-                        .saturating_sub(num_evicted)
-                        .saturating_sub(proposed_block_change_set.num_evicted_nodes_this_block() as u64);
-                    if max_allowed_to_evict == 0 {
-                        warn!(
-                            target: LOG_TARGET,
-                            "❌ NO VOTE: {}", NoVoteReason::CannotEvictNodeBelowQuorumThreshold
-                        );
-
-                        proposed_block_change_set.set_no_vote(NoVoteReason::CannotEvictNodeBelowQuorumThreshold);
-                        return Ok(());
-                    }
-
-                    let stats = ValidatorConsensusStats::get_by_public_key(tx, block.epoch(), &atom.public_key)?;
-                    if stats.missed_proposals < self.config.consensus_constants.missed_proposal_evict_threshold {
-                        warn!(
-                            target: LOG_TARGET,
-                            "❌ NO VOTE: {} (actual missed count: {}, threshold: {})", NoVoteReason::ShouldNotEvictNode, stats.missed_proposals, self.config.consensus_constants.missed_proposal_evict_threshold
-                        );
-
-                        proposed_block_change_set.set_no_vote(NoVoteReason::ShouldNotEvictNode);
-                        return Ok(());
-                    }
-
-                    info!(
-                        target: LOG_TARGET,
-                        "💀 EVICTING node: {} with missed count {}",
-                        atom.public_key,
-                        stats.missed_proposals
-                    );
-                    proposed_block_change_set.add_evict_node(atom.public_key);
                 },
                 Command::EndEpoch(atom) => {
                     if !can_propose_epoch_end {
@@ -710,7 +660,14 @@ where TConsensusSpec: ConsensusSpec
                                 return Ok(Some(NoVoteReason::LeaderFeeDisagreement));
                             }
 
-                            *total_leader_fee += calculated_leader_fee.fee();
+                            *total_leader_fee =
+                                total_leader_fee
+                                    .checked_add(calculated_leader_fee.fee())
+                                    .ok_or_else(|| {
+                                        HotStuffError::InvariantError(
+                                            "Leader fee overflow when summing for block".to_string(),
+                                        )
+                                    })?;
                             // A LocalOnly transaction's evidence must contain exactly the local shard group, so its
                             // portion of the exhaust burn is the entire burn.
                             if pool_tx.evidence().num_shard_groups() != 1 {
@@ -1438,7 +1395,9 @@ where TConsensusSpec: ConsensusSpec
             ))
         })?;
 
-        *total_leader_fee += leader_fee.fee();
+        *total_leader_fee = total_leader_fee
+            .checked_add(leader_fee.fee())
+            .ok_or_else(|| HotStuffError::InvariantError("Leader fee overflow when summing for block".to_string()))?;
         // Compute the portion from the local record's evidence: its key order is locally maintained (sorted), whereas
         // the atom's wire-decoded key order is not consensus-checked (evidence equality is order-independent).
         let Some(exhaust_burn_portion) = tx_rec
@@ -1731,10 +1690,6 @@ where TConsensusSpec: ConsensusSpec
         for atom in block.all_foreign_proposals() {
             // TODO: we need to keep these ATM to send them if a node needs to catch up
             atom.set_status(tx, ForeignProposalStatus::Confirmed, None)?;
-        }
-
-        for atom in block.all_node_evictions() {
-            atom.mark_as_committed_in_epoch(tx, block.epoch())?;
         }
 
         // NOTE: this must happen before we commit the substate diff because the state transitions use this version

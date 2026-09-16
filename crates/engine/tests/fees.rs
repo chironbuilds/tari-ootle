@@ -8,7 +8,7 @@ use tari_engine_types::{
     fees::{FeeReceipt, FeeSource},
     limits::ENGINE_LIMITS,
 };
-use tari_ootle_transaction::{Epoch, Transaction, args};
+use tari_ootle_transaction::{Epoch, INVOCATION_FLOOR, Transaction, args};
 use tari_template_lib::types::{
     Amount,
     ComponentAddress,
@@ -36,7 +36,7 @@ fn deducts_fees_from_payments_and_refunds_the_rest() {
 
     let result = test.execute_expect_success(
         Transaction::builder_localnet(Epoch(1))
-            .pay_fee_from_component(account, 1000u64)
+            .pay_fee_from_component(account, 2000u64)
             .call_function(test.get_template_address("State"), "new", args![])
             .build_and_seal(&private_key),
         vec![owner_token],
@@ -54,7 +54,7 @@ fn deducts_fees_from_payments_and_refunds_the_rest() {
         .unwrap()
         .balance();
     assert_eq!(new_balance, orig_balance - payment.total_fees_charged());
-    assert_eq!(payment.total_refunded(), 1000 - payment.total_fees_charged());
+    assert_eq!(payment.total_refunded(), 2000 - payment.total_fees_charged());
     assert!(payment.is_paid_in_full());
 }
 
@@ -147,7 +147,7 @@ fn deposit_from_faucet_then_pay() {
                 builder
                     // Faucet deposits free coins into the account
                     .call_method(xtr_faucet_component(), "take", args![account])
-                    .call_method(account, "pay_fee", args![3000])
+                    .call_method(account, "pay_fee", args![4000])
             })
             .call_function(test.get_template_address("State"), "new", args![])
             .build_and_seal(&private_key),
@@ -185,7 +185,7 @@ fn another_account_pays_partially_for_fees() {
             // Faucet pays a little
             .pay_fee_from_component(account_fee, Amount::from(FAUCET_CAP))
             // Account pays the rest
-            .pay_fee_from_component(account_fee2, Amount::from(3000u64))
+            .pay_fee_from_component(account_fee2, Amount::from(6000u64))
             .call_method(xtr_faucet_component(), "take", args![account])
             // NOTE: the test harness provides the virtual proofs as provided, so the transaction signer does not matter
             .build_and_seal(test.secret_key()),
@@ -317,8 +317,8 @@ fn spend_the_whole_allowance_and_still_pay(burn_rate_bps: u16) {
     let (account, owner_token, key) = test.create_funded_account();
     test.enable_fees();
 
-    // Run at a burn too, since the burn is taken over the charges rather than deducted from the
-    // payment: an allowance computed against the raw payment leaves nothing to pay it with.
+    // Run at a burn too: the burn is a share of what is paid, so it must not narrow what the
+    // payment can fund nor leave any of it uncollected.
     test.set_burn_rate_bps(burn_rate_bps);
 
     // A loop that never returns: it runs until the compute allowance stops it, whatever that
@@ -346,13 +346,24 @@ fn spend_the_whole_allowance_and_still_pay(burn_rate_bps: u16) {
         receipt.total_fees_paid(),
         "at {burn_rate_bps} bps the transaction should spend the payment down to the microtari"
     );
-    // The burn's rounding leaves a few microtari of the payment unspent, so this is "nearly all of
-    // it" rather than exactly all: what matters is that the allowance is sized against the payment
-    // and not beyond it.
+    // The allowance is sized against the payment and not beyond it, so the loop spends the payment
+    // to the last microtari the metering divisor can resolve.
     assert!(
         receipt.total_fees_paid() > MAX_FEE - 100,
         "at {burn_rate_bps} bps only {} of {MAX_FEE} was spent",
         receipt.total_fees_paid()
+    );
+    // The burn is taken out of what was paid, not added to it.
+    let expected_burn = u128::from(receipt.total_fees_paid()) * u128::from(burn_rate_bps) / 10_000;
+    assert_eq!(
+        u128::from(receipt.exhaust_burn()),
+        expected_burn,
+        "at {burn_rate_bps} bps"
+    );
+    assert_eq!(
+        receipt.pre_burn_fees_paid() + receipt.exhaust_burn(),
+        receipt.total_fees_paid(),
+        "at {burn_rate_bps} bps"
     );
 }
 
@@ -422,10 +433,13 @@ fn fail_partial_paid_fees() {
     let orig_balance: Amount = test.call_method(account, "balance", args![STEALTH_TARI_RESOURCE_ADDRESS], vec![]);
     test.enable_fees();
 
-    // Must cover what committing the fee intent costs — otherwise nothing commits at all — yet stay
-    // smaller than the full transaction's fee, so the main instructions exhaust the compute the
-    // payment funds and trap.
-    const FEE_PAID: u64 = 1000;
+    // The payment lands in the window where all three hold: the fee intent commits on its own, the
+    // main instructions run far enough to overrun the fee they funded, and that overrun surfaces as
+    // `InsufficientFeesPaid`. Fund less and the native verification allowance runs out part-way
+    // through an instruction, which rejects as an execution failure instead; fund more and the whole
+    // transaction is affordable. Engine pricing changes move the window, so re-tune against the fee
+    // the transaction reports when it succeeds.
+    const FEE_PAID: u64 = 1700;
 
     let result = test.execute_expect_commit(
         Transaction::builder_localnet(Epoch(1))
@@ -479,6 +493,40 @@ fn fail_partial_paid_fees() {
         .unwrap()
         .balance();
     assert_eq!(new_balance, orig_balance - Amount::from(total_fees));
+}
+
+/// Running out of the compute the fee funds is a fee shortfall wherever it is noticed. A transaction that stops
+/// part-way through reports it the same way as one that runs to the end and is found short, so a payer is told to
+/// raise the fee rather than to go looking for a bug in the template.
+#[test]
+fn underfunded_compute_rejects_as_a_fee_shortfall() {
+    // Funding the wasm path and the native path takes different amounts: too little and execution stops inside the
+    // first method's wasm, a little more and it reaches a native stealth verification it cannot fund.
+    for fee_paid in [1000u64, 1300] {
+        let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
+
+        let (account, owner_token, private_key) = test.create_funded_account();
+        let (account2, owner_token2, _) = test.create_funded_account();
+        test.enable_fees();
+
+        let result = test.execute_expect_commit(
+            Transaction::builder_localnet(Epoch(1))
+                .pay_fee_from_component(account, Amount::from(fee_paid))
+                .call_method(account2, "withdraw", args![STEALTH_TARI_RESOURCE_ADDRESS, 1000])
+                .put_last_instruction_output_on_workspace("bucket")
+                .take_from_bucket("bucket", 500u64, "bucket2")
+                .call_method(account, "deposit", args![Workspace("bucket")])
+                .call_method(account, "deposit", args![Workspace("bucket2")])
+                .build_and_seal(&private_key),
+            vec![owner_token, owner_token2],
+        );
+
+        let reason = result.expect_failure();
+        assert!(
+            matches!(reason, RejectReason::InsufficientFeesPaid(_)),
+            "paying {fee_paid} gave: {reason}"
+        );
+    }
 }
 
 #[test]
@@ -761,15 +809,17 @@ fn state_transaction<'a>(
     }
 }
 
-/// `max_fee` is the only literal arg of the `pay_fee` instruction, and `calc_args_weight` prices an
-/// instruction's literals at `total_bytes / LITERAL_BYTE_DIVISOR`. The whole weight of this
-/// transaction is that one term, so it steps whenever the encoded width crosses the divisor.
+/// `max_fee` is the only literal arg of the `pay_fee` instruction, so `calc_args_weight` reads its
+/// encoded width. Every invocation carries at least [`INVOCATION_FLOOR`], and an `Amount` is far too
+/// narrow for its literal term to reach that floor, so the weight of a transaction this shape is the
+/// floor for each of its two calls and `max_fee` cannot move it.
 #[test]
-fn transaction_weight_follows_the_max_fee_literal_width() {
-    const LITERAL_BYTE_DIVISOR: u64 = 3;
+fn transaction_weight_does_not_follow_the_max_fee_literal_width() {
     // Straddles an encoding-width boundary while keeping the digit count and the residual balance's
-    // width fixed, so the weight charge is the only thing that can move.
+    // width fixed, so the weight charge is the only thing that could move.
     const MAX_FEES: [u64; 2] = [65_535, 65_536];
+    // `pay_fee_from_component` and the `State::new` call.
+    const INVOCATIONS: u64 = 2;
 
     let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let (account, owner_token, key) = test.create_funded_account();
@@ -784,7 +834,7 @@ fn transaction_weight_follows_the_max_fee_literal_width() {
     for (max_fee, receipt) in MAX_FEES.iter().zip(&receipts) {
         assert_eq!(
             receipt.fee_breakdown().get(FeeSource::TransactionWeight),
-            (amount_len(*max_fee) / LITERAL_BYTE_DIVISOR) * per_weight,
+            INVOCATIONS * INVOCATION_FLOOR * per_weight,
             "TransactionWeight at max_fee {max_fee}"
         );
         assert_eq!(
@@ -872,7 +922,7 @@ fn storage_follows_the_residual_vault_balance_width() {
 /// the three mechanisms above do not account for the whole drift.
 #[test]
 fn no_charge_other_than_weight_and_storage_moves_with_max_fee() {
-    const MAX_FEES: [u64; 6] = [1_000, 65_535, 65_536, 100_000_000, FUNDED - 60_000, FUNDED - 10];
+    const MAX_FEES: [u64; 6] = [2_000, 65_535, 65_536, 100_000_000, FUNDED - 60_000, FUNDED - 10];
 
     let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let (account, owner_token, key) = test.create_funded_account();
@@ -888,7 +938,7 @@ fn no_charge_other_than_weight_and_storage_moves_with_max_fee() {
 #[test]
 fn a_template_publish_introduces_no_further_max_fee_sensitivity() {
     // Every entry clears the publish cost; between them they move all three quantities.
-    const MAX_FEES: [u64; 4] = [400_000, 100_000_000, FUNDED - 60_000, FUNDED - 10];
+    const MAX_FEES: [u64; 4] = [1_000_000, 100_000_000, FUNDED - 60_000, FUNDED - 10];
 
     let mut test = TemplateTest::new(CRATE_PATH, &[] as &[&str]);
     let (account, owner_proof, key, _) = test.create_funded_account_with_keypair();
@@ -912,13 +962,11 @@ fn a_template_publish_introduces_no_further_max_fee_sensitivity() {
 /// A dry run meters at whatever `max_fee` the caller submitted, and the submission built from it
 /// uses a smaller one, so the estimate has to hold in both directions — asserting it only from the
 /// cheapest run would assume the very thing the allowance exists to cover. The burn rate is varied
-/// because the burn is taken over the running total and so re-multiplies both terms; a bound
-/// established with the burn disabled would not hold on a live network.
+/// to show that it does not enter the price: the burn is a share of what is paid, not a charge.
 #[test]
 fn required_fees_covers_a_real_run_at_any_max_fee() {
     // Spans every encoding width a fee above this transaction's cost can take, every residual
     // width, and digit counts from four to nine.
-    // The smallest entry must still cover the transaction at a 100% burn, which roughly doubles it.
     const MAX_FEES: [u64; 8] = [
         2_000,
         65_535,
@@ -1024,32 +1072,36 @@ fn the_pay_fee_event_records_max_fee_in_decimal() {
     );
 }
 
-/// The exhaust burn adds no mechanism of its own but re-multiplies the others, being taken over the
-/// running total. At a 100% rate the compounding is exact: the total moves by twice the movement of
-/// the charges beneath it.
+/// The burn is settled over what was paid, so the rate moves nothing the payer is charged: the
+/// same transaction meters the same at any rate, and the receipt's burn is the share of the payment.
 #[test]
-fn the_exhaust_burn_compounds_the_drift() {
-    const FULL_RATE_BPS: u16 = 10_000;
-    // Four bytes of residual width apart, so the drift beneath the burn is unambiguously non-zero.
+fn the_exhaust_burn_does_not_move_the_charges() {
     const MAX_FEES: [u64; 2] = [65_536, FUNDED - 10];
 
-    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
-    let (account, owner_token, key) = test.create_funded_account();
-    test.enable_fees();
-    test.set_burn_rate_bps(FULL_RATE_BPS);
-    let build = state_transaction(&test, account, &key);
-    let receipts = meter_across_max_fees(&mut test, &MAX_FEES, &[owner_token], build);
+    let mut charged_at_rate = Vec::new();
+    for rate in [0u16, 500, 10_000] {
+        let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
+        let (account, owner_token, key) = test.create_funded_account();
+        test.enable_fees();
+        test.set_burn_rate_bps(rate);
+        let build = state_transaction(&test, account, &key);
+        let receipts = meter_across_max_fees(&mut test, &MAX_FEES, &[owner_token], build);
 
-    let pre_burn = |r: &FeeReceipt| r.total_fees_charged() - r.fee_breakdown().get(FeeSource::ExhaustBurn);
-    let pre_burn_delta = pre_burn(&receipts[1]).abs_diff(pre_burn(&receipts[0]));
-    assert!(pre_burn_delta > 0, "the chosen max_fees must move the pre-burn charges");
-    assert_eq!(
-        receipts[1]
-            .total_fees_charged()
-            .abs_diff(receipts[0].total_fees_charged()),
-        pre_burn_delta * 2,
-        "a 100% burn doubles whatever the max_fee-sensitive charges contribute"
-    );
+        for receipt in &receipts {
+            assert_eq!(
+                receipt.fee_breakdown().get(FeeSource::Reserved),
+                0,
+                "at {rate} bps the burn must not be charged"
+            );
+            let expected_burn = u128::from(receipt.total_fees_paid()) * u128::from(rate) / 10_000;
+            assert_eq!(u128::from(receipt.exhaust_burn()), expected_burn, "at {rate} bps");
+        }
+        charged_at_rate.push(receipts.iter().map(|r| r.total_fees_charged()).collect::<Vec<_>>());
+    }
+
+    for charged in &charged_at_rate[1..] {
+        assert_eq!(charged, &charged_at_rate[0], "the rate must not move what is charged");
+    }
 }
 
 #[test]
@@ -1064,7 +1116,7 @@ fn template_load_fee_charged_once_per_template_per_transaction() {
     // Single State call — establishes the baseline TemplateLoad fee for {Account, State}.
     let single = test.execute_expect_success(
         Transaction::builder_localnet(Epoch(1))
-            .pay_fee_from_component(account, 1000u64)
+            .pay_fee_from_component(account, 4000u64)
             .call_method(state, "set", args![1u32])
             .build_and_seal(&private_key),
         vec![owner_token.clone()],
@@ -1074,7 +1126,7 @@ fn template_load_fee_charged_once_per_template_per_transaction() {
     // would scale with call count; with dedup it must match the single-call baseline.
     let many = test.execute_expect_success(
         test.transaction()
-            .pay_fee_from_component(account, 1000u64)
+            .pay_fee_from_component(account, 4000u64)
             .call_method(state, "set", args![1u32])
             .call_method(state, "set", args![2u32])
             .call_method(state, "set", args![3u32])

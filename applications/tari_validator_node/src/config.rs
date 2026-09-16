@@ -35,6 +35,7 @@ use tari_ootle_app_utilities::{
 };
 use tari_ootle_template_provider::TemplateConfig;
 use tari_ootle_transaction::Network;
+use tari_state_store_rocksdb::DatabaseOptions;
 
 #[derive(Debug, Clone)]
 pub struct ApplicationConfig {
@@ -80,6 +81,12 @@ pub struct ValidatorNodeConfig {
     pub data_dir: PathBuf,
     /// An absolute or relative (to data_dir) path to the state database
     pub state_db_path: PathBuf,
+    /// An absolute or relative (to data_dir) path to a file of consensus constant overrides, read
+    /// once at startup and only on LocalNet. Setting it says the file is expected, so a node that
+    /// cannot find it refuses to start. Leave it unset to pick up
+    /// `<data_dir>/consensus_constants.toml` if it happens to be there.
+    #[serde(default)]
+    pub localnet_consensus_constants_file: Option<PathBuf>,
     /// Database config
     // pub database: tari_any_state_store::Config,
     /// The p2p configuration settings
@@ -123,11 +130,20 @@ pub struct ValidatorNodeConfig {
     /// sizes this admits a very deep backlog, while capping a flood of maximum-size messages.
     #[serde(default = "default_max_transaction_gossip_queue_bytes")]
     pub max_transaction_gossip_queue_bytes: usize,
-    /// Maximum total size of inbound consensus gossip awaiting processing. This topic carries
-    /// `HotStuffMessage`s between shard groups, including block-sized foreign proposals, and it
-    /// feeds a short blocking channel into consensus — so this queue absorbs real bursts rather
-    /// than sitting idle. Budgeted above transactions because a dropped proposal or vote can cost a
-    /// view, whereas a dropped transaction can be re-requested.
+    /// Maximum total size of inbound consensus gossip awaiting processing.
+    ///
+    /// The topic carries only `HotstuffMessage::ForeignProposalNotification` — a block id, an epoch
+    /// and a shard group list. The proposal itself is requested over the messaging protocol, so
+    /// legitimate traffic here is a few hundred bytes per message and nowhere near this budget.
+    ///
+    /// The budget is not sized for legitimate traffic. It is sized for what a flood can queue before
+    /// the node starts dropping, and the topic is open to anyone: a message is only known to be
+    /// undecodable or invalid after it has been drained. It is set above the transaction topic's
+    /// because a dropped notification delays a foreign proposal the local committee is waiting on,
+    /// whereas a dropped transaction can be re-gossiped.
+    ///
+    /// No measurement supports this particular figure. Now that the legitimate traffic on this topic
+    /// is known to be small, it is the queue most likely to be over-provisioned.
     #[serde(default = "default_max_consensus_gossip_queue_bytes")]
     pub max_consensus_gossip_queue_bytes: usize,
     /// Maximum total size of inbound direct consensus messages awaiting processing. Carries
@@ -136,6 +152,12 @@ pub struct ValidatorNodeConfig {
     /// equally liveness-critical.
     #[serde(default = "default_max_consensus_messaging_queue_bytes")]
     pub max_consensus_messaging_queue_bytes: usize,
+    /// Total memory the state store may hold across its block cache and memtables, shared by every
+    /// column family. Half is given to memtables and the rest stays available to cache reads.
+    /// Larger trades memory for fewer disk reads and less frequent flushing; it is the largest
+    /// single line in the node's memory budget, which is logged at startup.
+    #[serde(default = "default_state_store_memory_budget_bytes")]
+    pub state_store_memory_budget_bytes: usize,
 }
 
 fn default_max_transaction_gossip_queue_bytes() -> usize {
@@ -150,7 +172,25 @@ fn default_max_consensus_messaging_queue_bytes() -> usize {
     128 * 1024 * 1024
 }
 
+fn default_state_store_memory_budget_bytes() -> usize {
+    tari_state_store_rocksdb::DEFAULT_MEMORY_BUDGET_BYTES
+}
+
 impl ValidatorNodeConfig {
+    /// Database options for the state store this node opens.
+    ///
+    /// The memory budget is one capacity covering the block cache and memtables together, split so
+    /// that memtables take half and the rest stays available to cache reads — RocksDB's own
+    /// guidance, and the split the startup memory budget assumes.
+    pub fn state_store_options(&self) -> DatabaseOptions {
+        DatabaseOptions::default()
+            // TODO: just enable it always for now, later make it configurable and default to true for testnets
+            .with_debugging_data(true)
+            .with_prune_transaction_history(!self.keep_transaction_history)
+            .with_memory_budget_bytes(self.state_store_memory_budget_bytes)
+            .with_memtable_budget_bytes(self.state_store_memory_budget_bytes / 2)
+    }
+
     pub fn set_base_path<P: AsRef<Path>>(&mut self, base_path: P) {
         if !self.shard_key_file.is_absolute() {
             self.shard_key_file = base_path.as_ref().join(&self.shard_key_file);
@@ -164,12 +204,24 @@ impl ValidatorNodeConfig {
         if !self.state_db_path.is_absolute() {
             self.state_db_path = self.data_dir.join(&self.state_db_path);
         }
+        if let Some(path) = self
+            .localnet_consensus_constants_file
+            .as_ref()
+            .filter(|p| !p.is_absolute())
+        {
+            self.localnet_consensus_constants_file = Some(self.data_dir.join(path));
+        }
         // if !self.database.rocks_db.path.is_absolute() {
         //     self.database.rocks_db.path = self.data_dir.as_ref().join(&self.database.rocks_db.path);
         // }
         // if !self.database.sqlite.path.is_absolute() {
         //     self.database.sqlite.path = self.data_dir.as_ref().join(&self.database.sqlite.path);
         // }
+    }
+
+    /// Where a consensus constants file is picked up from when none is configured.
+    pub fn default_localnet_consensus_constants_file(&self) -> PathBuf {
+        self.data_dir.join("consensus_constants.toml")
     }
 
     pub fn get_global_db_path(&self) -> PathBuf {
@@ -185,6 +237,7 @@ impl Default for ValidatorNodeConfig {
             identity_file: PathBuf::from("validator_node_id.json"),
             data_dir: PathBuf::from("data/validator_node"),
             state_db_path: PathBuf::from("rocksdb"),
+            localnet_consensus_constants_file: None,
             // database: tari_any_state_store::Config {
             //     database_type: AnyDatabaseType::Sqlite,
             //     rocks_db: RocksConfig { path: "rocksdb".into() },
@@ -209,6 +262,7 @@ impl Default for ValidatorNodeConfig {
             max_transaction_gossip_queue_bytes: default_max_transaction_gossip_queue_bytes(),
             max_consensus_gossip_queue_bytes: default_max_consensus_gossip_queue_bytes(),
             max_consensus_messaging_queue_bytes: default_max_consensus_messaging_queue_bytes(),
+            state_store_memory_budget_bytes: default_state_store_memory_budget_bytes(),
         }
     }
 }
@@ -219,26 +273,13 @@ impl SubConfigPath for ValidatorNodeConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ConsensusConfig {
-    /// Enable proposing evictions for inactive validators. If disabled, this validator will still vote on eviction
-    /// proposals from other validators, including voting in the affirmative if applicable, but will never propose
-    /// evictions itself.
-    pub enable_eviction_proposal: bool,
     /// Skip the state sync check on startup and go directly into consensus. This makes `check_sync` always report
     /// up-to-date, so the node will never enter the syncing state. Intended for local development and recovery
     /// scenarios — running with this enabled against a network where the node is actually behind will cause
     /// consensus to misbehave.
     #[serde(default)]
     pub skip_sync: bool,
-}
-
-impl Default for ConsensusConfig {
-    fn default() -> Self {
-        Self {
-            enable_eviction_proposal: true,
-            skip_sync: false,
-        }
-    }
 }

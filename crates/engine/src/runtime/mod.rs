@@ -62,6 +62,7 @@ use tari_engine_types::{
     confidential::{ClaimBurnOutputData, MinotariBurnClaimProof},
     fees::FeeReceipt,
     indexed_value::{IndexedValue, IndexedWellKnownTypes},
+    limits::ModuleShape,
     lock::LockFlag,
     published_template::TemplateBlob,
 };
@@ -106,7 +107,8 @@ use tari_template_lib::{
         NonFungibleAddress,
         TemplateAddress,
         ValidatorFeePoolAddress,
-        engine_args::SignatureAction,
+        crypto::RistrettoPublicKeyBytes,
+        engine_args::IntrinsicId,
         stealth::StealthTransferStatement,
     },
 };
@@ -116,7 +118,7 @@ pub use working_state::ChargeableState;
 use crate::runtime::{locking::LockedSubstate, scope::PushCallFrame};
 
 pub trait RuntimeInterface {
-    fn next_entity_id(&self) -> Result<EntityId, RuntimeError>;
+    fn next_entity_id(&mut self) -> Result<EntityId, RuntimeError>;
     fn emit_event(&mut self, topic: String, payload: Metadata) -> Result<(), RuntimeError>;
 
     fn emit_log(&mut self, level: LogLevel, message: String) -> Result<(), RuntimeError>;
@@ -214,6 +216,14 @@ pub trait RuntimeInterface {
     /// Checks whether the current execution context has owner permission of the given component.
     fn check_component_ownership(&self, action: ActionIdent) -> Result<(), RuntimeError>;
 
+    /// Ends the current frame's call boundary by revoking the proofs that were in scope only for the boundary
+    /// check. Must run after the frame's access rule has been evaluated and before anything acts in the frame.
+    fn revoke_boundary_proofs(&mut self) -> Result<(), RuntimeError>;
+
+    /// Asserts that the signer badge for `public_key` is in the transaction's base auth scope, i.e. that the
+    /// transaction is signed by that key.
+    fn check_signer_badge_in_scope(&self, public_key: RistrettoPublicKeyBytes) -> Result<(), RuntimeError>;
+
     fn update_component_template(&mut self, new_template: TemplateAddress) -> Result<(), RuntimeError>;
 
     fn validate_return_value(&self, value: &IndexedValue) -> Result<(), RuntimeError>;
@@ -228,7 +238,9 @@ pub trait RuntimeInterface {
     ) -> Result<(), RuntimeError>;
     fn put_on_workspace(&mut self, id: WorkspaceId, value: IndexedValue) -> Result<(), RuntimeError>;
 
-    fn signature_invoke(&mut self, action: SignatureAction, args: EngineArgs) -> Result<InvokeResult, RuntimeError>;
+    /// Runs a native intrinsic — a pure function of its arguments, priced from those arguments and
+    /// charged before it runs. Backs the `tari_template_lib::intrinsics` API.
+    fn intrinsic_invoke(&mut self, intrinsic: IntrinsicId, args: EngineArgs) -> Result<InvokeResult, RuntimeError>;
 
     /// Read-only introspection over the spending `StealthTransferStatement`, available only while a spend-script
     /// predicate is executing. Backs the `SpendContext` template-lib API.
@@ -262,6 +274,17 @@ pub trait RuntimeInterface {
     /// nested cross-template calls.
     fn record_wasm_execution(&mut self, points_consumed: u64) -> Result<(), RuntimeError>;
 
+    /// Charges the cost of building the `Store` and `Instance` a template call runs in, before the
+    /// instance exists and before the first metered operator. Priced by
+    /// [`tari_engine_types::limits::instantiation_points`] and charged against the same compute
+    /// allowance as native verification, so a call that cannot cover it fails having done none of
+    /// the work.
+    fn charge_template_instantiation(&mut self, shape: &ModuleShape) -> Result<(), RuntimeError>;
+
+    /// Charges the Cranelift compile a `PublishTemplate` instruction makes every validator run,
+    /// before the compile starts. Priced by [`tari_engine_types::limits::template_compile_points`].
+    fn charge_template_compile(&mut self, binary_bytes: u64) -> Result<(), RuntimeError>;
+
     /// Total Wasmer metering points consumed by the transaction so far, across every template
     /// invocation. Used by `WasmProcess::invoke` to enforce `MAX_WASM_POINTS_PER_TRANSACTION`.
     fn wasm_points_consumed(&self) -> u64;
@@ -277,8 +300,8 @@ pub trait RuntimeInterface {
     /// what it would have cost.
     fn metered_fee_receipt(&self) -> FeeReceipt;
 
-    /// The payment those charges require, inclusive of the exhaust burn taken over them — the figure
-    /// a rejected payer has to raise their fee to.
+    /// The payment those charges require — the figure a rejected payer has to raise their fee to.
+    /// The exhaust burn is a share of what is paid rather than a charge, so it does not raise this.
     fn required_fee_payment(&self) -> u64;
 
     /// The maximum Wasmer metering points the transaction may consume given the fees paid so far,

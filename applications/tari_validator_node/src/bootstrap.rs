@@ -73,7 +73,7 @@ use tari_ootle_app_utilities::{
     transaction_executor::TariTransactionProcessor,
 };
 use tari_ootle_common_types::services::template_provider::TemplateProvider;
-use tari_ootle_p2p::{PeerAddress, TRANSACTION_TOPIC, TariMessagingSpec};
+use tari_ootle_p2p::{PeerAddress, TRANSACTION_TOPIC, TariMessagingSpec, max_gossip_message_size};
 use tari_ootle_storage::{StateStore, global::GlobalDb};
 use tari_ootle_storage_sqlite::global::SqliteGlobalDbAdapter;
 use tari_ootle_template_provider::MemoryCacheTemplateProvider;
@@ -82,6 +82,7 @@ use tari_ootle_transaction_validation::{
     BasicValidations,
     BlobReferenceValidator,
     EpochRangeValidator,
+    InputsAreNotVirtualValidator,
     PublishTemplateLimitValidator,
     SignatureLimitValidator,
     StealthTransactionLimitsValidator,
@@ -89,6 +90,7 @@ use tari_ootle_transaction_validation::{
     TransactionDryRunValidator,
     TransactionNetworkValidator,
     TransactionSignatureValidator,
+    TransactionSizeValidator,
     TransactionValidationError,
     TransactionValidityWindowValidator,
     TransactionWeightValidator,
@@ -97,7 +99,6 @@ use tari_ootle_transaction_validation::{
 };
 use tari_rpc_framework::RpcServer;
 use tari_shutdown::ShutdownSignal;
-use tari_state_store_rocksdb::DatabaseOptions;
 use tari_validator_node_rpc::client::TariValidatorNodeRpcClientFactory;
 use tokio::{
     sync::{broadcast, mpsc},
@@ -110,6 +111,8 @@ use crate::consensus::metrics::PrometheusConsensusMetrics;
 use crate::epoch_metrics::{EpochManagerCollector, MeteredEpochOracle, PrometheusEpochOracleMetrics};
 #[cfg(feature = "metrics")]
 use crate::inbound_queue_metrics::InboundQueueCollector;
+#[cfg(feature = "metrics")]
+use crate::state_store_metrics::StateStoreMemoryCollector;
 use crate::{
     ApplicationConfig,
     ValidatorNodeEpochManagerSpec,
@@ -123,6 +126,7 @@ use crate::{
         spec::ValidatorTemplateProvider,
     },
     file_l1_submitter::FileLayerOneSubmitter,
+    memory_budget,
     migrations,
     p2p::{
         NopLogger,
@@ -227,6 +231,7 @@ pub async fn spawn_services(
                     TRANSACTION_TOPIC.to_string(),
                     consensus_gossip::TOPIC_PREFIX.to_string(),
                 ],
+                gossip_sub_max_message_size: max_gossip_message_size(consensus_constants.max_transaction_size_bytes),
                 // TODO: allow node operator to configure
                 relay_circuit_limits: RelayCircuitLimits::high(),
                 relay_reservation_limits: RelayReservationLimits::high(),
@@ -251,13 +256,19 @@ pub async fn spawn_services(
 
     info!(target: LOG_TARGET, "State store initializing");
 
-    let state_store = ValidatorNodeStateStore::open(
-        &config.validator_node.state_db_path,
-        // TODO: just enable it always for now, later make it configurable and default to true for testnets
-        DatabaseOptions::default()
-            .with_debugging_data(true)
-            .with_prune_transaction_history(!config.validator_node.keep_transaction_history),
-    )?;
+    // TODO: just enable it always for now, later make it configurable and default to true for testnets
+    let db_options = config.validator_node.state_store_options();
+
+    memory_budget::check_against_available_memory(&memory_budget::MemoryBudget::from_config(
+        &config.validator_node,
+        &db_options,
+        &config.validator_node.templates,
+    ));
+
+    let state_store = ValidatorNodeStateStore::open(&config.validator_node.state_db_path, db_options)?;
+
+    #[cfg(feature = "metrics")]
+    StateStoreMemoryCollector::new(state_store.memory_budget().clone()).register(metrics_registry);
 
     state_store.with_write_tx(|tx| migrations::migrate(tx, config.network, &consensus_constants))?;
 
@@ -296,7 +307,6 @@ pub async fn spawn_services(
             global_db.clone(),
             keypair.public_key().to_byte_type(),
             epoch_event_oracle,
-            layer_one_transaction_submitter.clone(),
             shutdown.clone(),
         );
 
@@ -435,6 +445,7 @@ pub async fn spawn_services(
         global_db,
         template_provider,
         consensus_handle,
+        consensus_constants,
         state_store,
         handles,
         layer_one_transaction_submitter,
@@ -460,6 +471,7 @@ pub struct Services<TStore> {
     pub epoch_manager: EpochManagerHandle<PeerAddress>,
     pub template_provider: ValidatorTemplateProvider,
     pub consensus_handle: ConsensusHandle,
+    pub consensus_constants: ConsensusConstants,
     pub state_store: TStore,
     pub global_db: GlobalDb<SqliteGlobalDbAdapter<PeerAddress>>,
     pub layer_one_transaction_submitter: FileLayerOneSubmitter,
@@ -533,6 +545,9 @@ pub fn create_node_transaction_validator<TProvider: TemplateProvider>(
     TransactionNetworkValidator::new(network)
         .and_then(TransactionDryRunValidator)
         .and_then(BasicValidations::new())
+        // Bytes before weight: the byte cap is what the gossip message limit is derived from, so a
+        // transaction failing it could not have been relayed regardless of what it weighs.
+        .and_then(TransactionSizeValidator::new(constants.max_transaction_size_bytes))
         // Blob payloads must be exactly what the instructions reference: bad indices would only
         // fail at execution, and unreferenced blobs would never fail at all.
         .and_then(BlobReferenceValidator::new())
@@ -548,6 +563,14 @@ pub fn create_node_transaction_validator<TProvider: TemplateProvider>(
         .and_then(TemplateExistsValidator::new(template_manager))
 }
 
+/// Builds the validations applied when a transaction is admitted to this node's mempool: the node-local chain
+/// plus the two epoch-window rules and the ingress-only input check.
+///
+/// [`InputsAreNotVirtualValidator`] is deliberately here rather than in [`create_node_transaction_validator`], which
+/// also backs `TariBlockTransactionValidator`. A rejection rule in block validation is a consensus rule: an
+/// upgraded validator would refuse a block that a non-upgraded one accepts. Refusing at ingress costs the
+/// sender and nothing else, and a transaction that slips past an un-upgraded node's mempool still aborts at
+/// input resolution as it does today.
 pub fn create_mempool_transaction_validator<TProvider: TemplateProvider>(
     network: Network,
     template_manager: TProvider,
@@ -556,7 +579,8 @@ pub fn create_mempool_transaction_validator<TProvider: TemplateProvider>(
     WithContext::<Epoch, Transaction, TransactionValidationError>::new()
         .map_context(
             |_| (),
-            create_node_transaction_validator(network, template_manager, constants),
+            create_node_transaction_validator(network, template_manager, constants)
+                .and_then(InputsAreNotVirtualValidator::new()),
         )
         .and_then(EpochRangeValidator::new())
         .and_then(TransactionValidityWindowValidator::new(
@@ -615,7 +639,7 @@ async fn create_epoch_oracle<TStore: EpochOracleStore + BaseLayerBlockHeaderStor
     }
 }
 
-async fn create_base_layer_epoch_oracle<TStore: EpochOracleStore + BaseLayerBlockHeaderStore + 'static>(
+async fn create_base_layer_epoch_oracle<TStore: EpochOracleStore + BaseLayerBlockHeaderStore + Clone + 'static>(
     config: &ApplicationConfig,
     store: TStore,
     consensus_constants: &ConsensusConstants,
@@ -633,7 +657,6 @@ async fn create_base_layer_epoch_oracle<TStore: EpochOracleStore + BaseLayerBloc
             scanning_interval: config.epoch_oracle.base_layer.scanning_interval,
             sidechain_id: config.validator_node.sidechain_id.as_ref().map(|p| p.to_byte_type()),
             features,
-            epoch_end_spread_blocks: consensus_constants.epoch_end_spread_blocks,
         },
         config.network,
     ))

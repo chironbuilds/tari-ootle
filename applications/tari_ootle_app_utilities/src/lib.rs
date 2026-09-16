@@ -20,9 +20,12 @@
 // WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 // USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+#[cfg(feature = "execution")]
 pub mod claim_burn_proof_verifier;
 pub mod common_cli_args;
 pub mod configuration;
+#[cfg(feature = "consensus_constants")]
+pub mod consensus_constants_file;
 #[cfg(feature = "epoch_oracle")]
 pub mod epoch_oracle_config;
 pub mod fee_tables;
@@ -36,4 +39,5 @@ pub mod protocol_activation;
 pub mod seed_peer;
 pub mod shared_consts;
 pub mod tcp;
+#[cfg(feature = "execution")]
 pub mod transaction_executor;

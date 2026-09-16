@@ -4,7 +4,7 @@
 use tari_common_types::types::FixedHash;
 use tari_consensus_types::{BlockId, LeafBlock, PcId, QcId};
 use tari_epoch_manager::EpochManagerError;
-use tari_ootle_common_types::{Epoch, NodeHeight, ShardGroup, VersionedSubstateIdError, VotePower};
+use tari_ootle_common_types::{Epoch, NodeHeight, ProtocolVersion, ShardGroup, VersionedSubstateIdError, VotePower};
 use tari_ootle_storage::{
     StorageError,
     consensus_models::{
@@ -131,6 +131,18 @@ impl HotStuffError {
             _ => None,
         }
     }
+
+    /// True for errors that mean this node is behind its peers and must sync. These are a designed transition out
+    /// of the Running state, not a consensus failure, and must be classified as such wherever consensus errors are
+    /// reported. `state_machine::running` maps them to `NeedSync`.
+    pub fn is_sync_required(&self) -> bool {
+        matches!(
+            self,
+            Self::NeedsSync { .. } |
+                Self::FallenBehind { .. } |
+                Self::ProposalValidationError(ProposalValidationError::FutureEpoch { .. })
+        )
+    }
 }
 
 impl From<EpochManagerError> for HotStuffError {
@@ -220,6 +232,16 @@ pub enum ProposalValidationError {
     InvalidNetwork {
         expected_network: String,
         block_network: String,
+        block_id: BlockId,
+    },
+    #[error(
+        "Invalid protocol version in block {block_id}: this node's schedule puts epoch {epoch} at {expected_version} \
+         but the block was produced under {block_version}"
+    )]
+    InvalidProtocolVersion {
+        expected_version: ProtocolVersion,
+        block_version: ProtocolVersion,
+        epoch: Epoch,
         block_id: BlockId,
     },
     #[error("Invalid state merkle root for block {block_id}: calculated {calculated} but block has {from_block}")]

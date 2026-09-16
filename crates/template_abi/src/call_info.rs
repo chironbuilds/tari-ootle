@@ -36,10 +36,7 @@ pub struct CallInfo;
 impl CallInfo {
     #[cfg(feature = "std")]
     pub fn encode_v1_packed_size(args: &[tari_bor::Value]) -> Result<usize, tari_bor::BorError> {
-        let total_args_len = args
-            .iter()
-            .map(|a| tari_bor::encoded_len(&a))
-            .sum::<Result<usize, tari_bor::BorError>>()?;
+        let total_args_len = args.iter().map(|a| tari_bor::encoded_len(&a)).sum::<usize>();
         let total_len = CallHeader::SIZE + total_args_len + args.len() * size_of::<u32>();
         Ok(total_len)
     }
@@ -61,7 +58,6 @@ impl CallInfo {
         let args_lens = args.iter().map(|a| tari_bor::encoded_len(&a));
         // Args
         for (arg, len) in args.iter().zip(args_lens) {
-            let len = len?;
             let arg_len =
                 u32::try_from(len).map_err(|_| tari_bor::BorError::new("Argument length exceeds u32".to_string()))?;
             writer
@@ -114,11 +110,11 @@ impl<'a> PackedCallInfoReader<'a> {
     /// Panics if the argument length exceeds the data bounds (malformed data).
     pub fn next_arg(&mut self) -> Option<&'a [u8]> {
         // Read the length of the next argument
-        let len_slice = self.data.get(self.payload_offset..self.payload_offset + 4)?;
+        let start = self.payload_offset.checked_add(4)?;
+        let len_slice = self.data.get(self.payload_offset..start)?;
         let arg_len = decode_u32_le(len_slice) as usize;
-        let start = self.payload_offset + 4;
-        let end = start + arg_len;
-        self.payload_offset += 4 + arg_len;
+        let end = start.checked_add(arg_len)?;
+        self.payload_offset = end;
         Some(self.data.get(start..end).expect("ARGOVR"))
     }
 

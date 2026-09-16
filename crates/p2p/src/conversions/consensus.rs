@@ -57,6 +57,7 @@ use tari_ootle_common_types::{
     Epoch,
     ExtraData,
     NodeHeight,
+    ProtocolVersion,
     ShardGroup,
     ShardStateVersions,
     StateVersion,
@@ -68,7 +69,6 @@ use tari_ootle_storage::{
     consensus_models::{
         Command,
         EndEpochAtom,
-        EvictNodeAtom,
         Evidence,
         ForeignProposal,
         ForeignProposalAtom,
@@ -477,6 +477,7 @@ impl From<&consensus_models::BlockHeader> for proto::consensus::BlockHeader {
             epoch_hash: value.epoch_hash().as_bytes().to_vec(),
             extra_data: Some(value.extra_data().into()),
             accumulated_data: Some(value.accumulated_data().into()),
+            protocol_version: value.protocol_version().as_u32(),
         }
     }
 }
@@ -489,6 +490,8 @@ fn try_convert_proto_block_header(
     let network = u8::try_from(value.network)
         .map_err(|_| anyhow!("Block conversion: Invalid network byte {}", value.network))?
         .try_into()?;
+
+    let protocol_version = ProtocolVersion::try_from(value.protocol_version)?;
 
     let shard_group = ShardGroup::decode_from_u32(value.shard_group)
         .ok_or_else(|| anyhow!("Block shard_group ({}) is not a valid", value.shard_group))?;
@@ -507,6 +510,7 @@ fn try_convert_proto_block_header(
     if value.signature.is_none() {
         Ok(consensus_models::BlockHeader::dummy_block(
             network,
+            protocol_version,
             value.parent_id.try_into()?,
             proposed_by,
             NodeHeight(value.height),
@@ -527,6 +531,7 @@ fn try_convert_proto_block_header(
         // If there were a mismatch (perhaps due modified data over the wire) the signature verification will fail.
         let block = consensus_models::BlockHeader::create(
             network,
+            protocol_version,
             value.parent_id.try_into()?,
             justify_id,
             NodeHeight(value.height),
@@ -652,7 +657,6 @@ impl From<&Command> for proto::consensus::Command {
             Command::ForeignProposal(foreign_proposal) => {
                 proto::consensus::command::Command::ForeignProposal(foreign_proposal.into())
             },
-            Command::EvictNode(atom) => proto::consensus::command::Command::EvictNode(atom.into()),
             Command::EndEpoch(atom) => proto::consensus::command::Command::EndEpoch(atom.into()),
         };
 
@@ -674,7 +678,9 @@ impl TryFrom<proto::consensus::Command> for Command {
             proto::consensus::command::Command::ForeignProposal(foreign_proposal) => {
                 Command::ForeignProposal(foreign_proposal.try_into()?)
             },
-            proto::consensus::command::Command::EvictNode(atom) => Command::EvictNode(atom.try_into()?),
+            proto::consensus::command::Command::EvictNode(_) => {
+                return Err(anyhow!("EvictNode command is no longer supported"));
+            },
             proto::consensus::command::Command::EndEpoch(atom) => Command::EndEpoch(atom.try_into()?),
         })
     }
@@ -753,30 +759,6 @@ impl TryFrom<proto::consensus::ForeignProposalAtom> for ForeignProposalAtom {
             block_id: BlockId::try_from(value.block_id)?,
             shard_group: ShardGroup::decode_from_u32(value.shard_group)
                 .ok_or_else(|| anyhow!("Block shard_group ({}) is not a valid", value.shard_group))?,
-        })
-    }
-}
-
-// -------------------------------- EvictNodeAtom -------------------------------- //
-
-impl From<&EvictNodeAtom> for proto::consensus::EvictNodeAtom {
-    fn from(value: &EvictNodeAtom) -> Self {
-        Self {
-            public_key: value.public_key.as_bytes().to_vec(),
-        }
-    }
-}
-
-impl TryFrom<proto::consensus::EvictNodeAtom> for EvictNodeAtom {
-    type Error = anyhow::Error;
-
-    fn try_from(value: proto::consensus::EvictNodeAtom) -> Result<Self, Self::Error> {
-        Ok(Self {
-            public_key: value
-                .public_key
-                .as_slice()
-                .try_into()
-                .map_err(|e| anyhow!("EvictNodeAtom failed to decode public key: {e}"))?,
         })
     }
 }

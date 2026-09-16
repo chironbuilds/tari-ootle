@@ -17,8 +17,14 @@ use tari_engine_types::{
     transaction_receipt::TransactionReceipt,
 };
 use tari_indexer_client::types::TransactionSource;
-use tari_indexer_lib::substate_cache::{FetchWatermark, SubstateCacheEntryRef};
-use tari_ootle_common_types::{Epoch, StateVersion, shard::Shard, substate_type::SubstateType};
+use tari_indexer_lib::substate_cache::{FetchWatermark, SubstateCacheEntryRef, caches_nonexistence};
+use tari_ootle_common_types::{
+    Epoch,
+    StateVersion,
+    displayable::Displayable,
+    shard::Shard,
+    substate_type::SubstateType,
+};
 use tari_ootle_storage::{
     StorageError,
     consensus_models::{EpochCheckpoint, SubstateData, SubstateUpdateProof},
@@ -27,6 +33,7 @@ use tari_ootle_storage::{
 use tari_ootle_storage_sqlite::SqliteTransaction;
 use tari_ootle_transaction::{Transaction, TransactionId};
 use tari_template_lib_types::{TemplateAddress, TransactionReceiptAddress};
+use tari_validator_node_rpc::client::SubstateResult;
 
 use crate::{
     diesel::ExpressionMethods,
@@ -537,27 +544,75 @@ impl IndexerStoreWriteTransaction for SqliteStoreWriteTransaction<'_> {
         use crate::storage_sqlite::schema::{substate_cache, substate_cache_invalidations};
 
         let id = substate_id.to_string();
+        let version = entry.version.map(|v| v as i32);
+
+        // Nothing journals a first creation for a substate outside `caches_nonexistence`, so a
+        // record here that one does not exist could never be retracted and would stand until it
+        // ages out. The invariant is enforced where it can be broken rather than only at the callers.
+        if version.is_none() && !caches_nonexistence(substate_id) {
+            warn!(
+                target: LOG_TARGET,
+                "Refusing to cache the nonexistence of {substate_id}: no transition would retract it"
+            );
+            return Ok(false);
+        }
 
         // Read inside this transaction so that the journal and the insert cannot straddle a
         // concurrent invalidation commit.
-        let invalidated_at_version: Option<i64> = substate_cache_invalidations::table
-            .select(substate_cache_invalidations::state_version)
+        let journalled: Option<(i64, i32, bool)> = substate_cache_invalidations::table
+            .select((
+                substate_cache_invalidations::state_version,
+                substate_cache_invalidations::substate_version,
+                substate_cache_invalidations::spent,
+            ))
             .filter(substate_cache_invalidations::substate_id.eq(&id))
             .first(self.connection())
             .optional()
             .map_err(|e| StorageError::general(OPERATION, e))?;
 
-        if invalidated_at_version.is_some_and(|v| v as u64 > watermark.as_u64()) {
-            debug!(
-                target: LOG_TARGET,
-                "Discarding cache write for {substate_id} v{}: its shard advanced past the fetch",
-                entry.version
-            );
-            return Ok(false);
+        if let Some((invalidated_at_version, observed_version, observed_version_spent)) = journalled {
+            if invalidated_at_version as u64 > watermark.as_u64() {
+                debug!(
+                    target: LOG_TARGET,
+                    "Discarding cache write for {substate_id} v{}: its shard advanced past the fetch",
+                    entry.version.display()
+                );
+                return Ok(false);
+            }
+
+            // A fetch that started after the transition is not overtaken by it, but the member it
+            // asked can be behind: it answers with a version the stream has already shown this
+            // substate past. The transition left no cached row to rank that against, so the journal
+            // is what refuses it.
+            //
+            // A record that the substate does not exist is left to the ranking below. It is settled
+            // by f + 1 members rather than one, so a single member being behind cannot produce it,
+            // and refusing it here would suppress the legitimate one that follows a destroy.
+            if version.is_some_and(|v| v < observed_version) {
+                debug!(
+                    target: LOG_TARGET,
+                    "Discarding cache write for {substate_id} v{}: the stream has already seen v{observed_version}",
+                    entry.version.display()
+                );
+                return Ok(false);
+            }
+
+            // Where the journalled version is one the stream saw destroyed, it is the head only as a
+            // `Down`, which is what a lookup for it answers. A member behind enough to still hold it
+            // live offers an `Up` at the same version, and only the provenance tells the two apart.
+            let claims_live_at_floor =
+                version == Some(observed_version) && matches!(entry.substate_result, SubstateResult::Up { .. });
+            if observed_version_spent && claims_live_at_floor {
+                debug!(
+                    target: LOG_TARGET,
+                    "Discarding cache write for {substate_id} v{observed_version}: the stream saw that version spent"
+                );
+                return Ok(false);
+            }
         }
 
         // A committee member that is behind can answer with a version below the head already held.
-        let cached: Option<(i32, bool, i64)> = substate_cache::table
+        let cached: Option<(Option<i32>, bool, i64)> = substate_cache::table
             .select((
                 substate_cache::version,
                 substate_cache::verified,
@@ -579,7 +634,9 @@ impl IndexerStoreWriteTransaction for SqliteStoreWriteTransaction<'_> {
             // way one recorded above the real version is ever corrected.
             let outranked = entry.verified && !cached_verified;
             let aged_out = !cached_verified && unix_timestamp().saturating_sub(cached_at) > head_ttl.as_secs() as i64;
-            if cached_version > entry.version as i32 && !outranked && !aged_out {
+            // A substate that does not exist ranks below every version, which `Option`'s own ordering
+            // gives: nonexistence yields to any head, and any head displaces it.
+            if cached_version > version && !outranked && !aged_out {
                 return Ok(false);
             }
         }
@@ -589,7 +646,7 @@ impl IndexerStoreWriteTransaction for SqliteStoreWriteTransaction<'_> {
         diesel::insert_into(substate_cache::table)
             .values((
                 substate_cache::substate_id.eq(&id),
-                substate_cache::version.eq(entry.version as i32),
+                substate_cache::version.eq(version),
                 substate_cache::verified.eq(entry.verified),
                 substate_cache::substate_result.eq(&encoded),
                 substate_cache::cached_at.eq(entry.cached_at as i64),
@@ -597,7 +654,7 @@ impl IndexerStoreWriteTransaction for SqliteStoreWriteTransaction<'_> {
             .on_conflict(substate_cache::substate_id)
             .do_update()
             .set((
-                substate_cache::version.eq(entry.version as i32),
+                substate_cache::version.eq(version),
                 substate_cache::verified.eq(entry.verified),
                 substate_cache::substate_result.eq(&encoded),
                 substate_cache::cached_at.eq(entry.cached_at as i64),
@@ -612,42 +669,28 @@ impl IndexerStoreWriteTransaction for SqliteStoreWriteTransaction<'_> {
         &mut self,
         invalidations: I,
         state_version: StateVersion,
-    ) -> Result<(), StorageError> {
-        const OPERATION: &str = "substate_cache_invalidate";
-        use crate::storage_sqlite::schema::{substate_cache, substate_cache_invalidations};
-
+    ) -> Result<usize, StorageError> {
         let now = unix_timestamp();
+        let mut retired = 0;
         for invalidation in invalidations {
-            let id = invalidation.substate_id().to_string();
-
-            diesel::delete(
-                substate_cache::table
-                    .filter(substate_cache::substate_id.eq(&id))
-                    .filter(substate_cache::version.le(invalidation.retires_up_to() as i32)),
-            )
-            .execute(self.connection())
-            .map_err(|e| StorageError::general(OPERATION, e))?;
-
-            diesel::insert_into(substate_cache_invalidations::table)
-                .values((
-                    substate_cache_invalidations::substate_id.eq(&id),
-                    substate_cache_invalidations::state_version.eq(state_version.as_u64() as i64),
-                    substate_cache_invalidations::invalidated_at.eq(now),
-                ))
-                .on_conflict(substate_cache_invalidations::substate_id)
-                .do_update()
-                .set((
-                    substate_cache_invalidations::state_version.eq(state_version.as_u64() as i64),
-                    substate_cache_invalidations::invalidated_at.eq(now),
-                ))
-                .execute(self.connection())
-                .map_err(|e| StorageError::general(OPERATION, e))?;
+            retired += self.apply_substate_cache_invalidation(&invalidation, state_version, now)?;
         }
-
-        Ok(())
+        Ok(retired)
     }
 
-    fn substate_cache_prune(&mut self, journal_retention: Duration, max_entries: usize) -> Result<(), StorageError> {
+    fn substate_cache_retire_ahead<I: IntoIterator<Item = (SubstateCacheInvalidation, StateVersion)>>(
+        &mut self,
+        invalidations: I,
+    ) -> Result<usize, StorageError> {
+        let now = unix_timestamp();
+        let mut retired = 0;
+        for (invalidation, state_version) in invalidations {
+            retired += self.apply_substate_cache_invalidation(&invalidation, state_version, now)?;
+        }
+        Ok(retired)
+    }
+
+    fn substate_cache_prune(&mut self, journal_retention: Duration, max_entries: usize) -> Result<usize, StorageError> {
         const OPERATION: &str = "substate_cache_prune";
         use crate::storage_sqlite::schema::{substate_cache, substate_cache_invalidations};
 
@@ -664,7 +707,7 @@ impl IndexerStoreWriteTransaction for SqliteStoreWriteTransaction<'_> {
             .map_err(|e| StorageError::general(OPERATION, e))?;
         let excess = count.saturating_sub(max_entries as i64);
         if excess <= 0 {
-            return Ok(());
+            return Ok(0);
         }
 
         // An evicted entry costs one committee round trip to restore, so oldest-written-first is a
@@ -676,9 +719,7 @@ impl IndexerStoreWriteTransaction for SqliteStoreWriteTransaction<'_> {
         )
         .bind::<diesel::sql_types::BigInt, _>(excess)
         .execute(self.connection())
-        .map_err(|e| StorageError::general(OPERATION, e))?;
-
-        Ok(())
+        .map_err(|e| StorageError::general(OPERATION, e))
     }
 
     fn upsert_verified_state_root(&mut self, root: &VerifiedStateRoot) -> Result<(), StorageError> {
@@ -761,5 +802,73 @@ impl Drop for SqliteStoreWriteTransaction<'_> {
                 "Substate store write transaction was not committed/rolled back"
             );
         }
+    }
+}
+
+impl SqliteStoreWriteTransaction<'_> {
+    fn apply_substate_cache_invalidation(
+        &mut self,
+        invalidation: &SubstateCacheInvalidation,
+        state_version: StateVersion,
+        now: i64,
+    ) -> Result<usize, StorageError> {
+        const OPERATION: &str = "substate_cache_invalidate";
+        use crate::storage_sqlite::schema::{substate_cache, substate_cache_invalidations};
+
+        let id = invalidation.substate_id().to_string();
+        let mut retired = 0;
+
+        if let Some(retires_up_to) = invalidation.retires_up_to() {
+            retired += diesel::delete(
+                substate_cache::table
+                    .filter(substate_cache::substate_id.eq(&id))
+                    .filter(substate_cache::version.le(retires_up_to as i32)),
+            )
+            .execute(self.connection())
+            .map_err(|e| StorageError::general(OPERATION, e))?;
+        }
+
+        if invalidation.retires_nonexistence() {
+            retired += diesel::delete(
+                substate_cache::table
+                    .filter(substate_cache::substate_id.eq(&id))
+                    .filter(substate_cache::version.is_null()),
+            )
+            .execute(self.connection())
+            .map_err(|e| StorageError::general(OPERATION, e))?;
+        }
+
+        diesel::insert_into(substate_cache_invalidations::table)
+            .values((
+                substate_cache_invalidations::substate_id.eq(&id),
+                substate_cache_invalidations::state_version.eq(state_version.as_u64() as i64),
+                substate_cache_invalidations::substate_version.eq(invalidation.observed_version() as i32),
+                substate_cache_invalidations::spent.eq(invalidation.is_observed_version_spent()),
+                substate_cache_invalidations::invalidated_at.eq(now),
+            ))
+            .on_conflict(substate_cache_invalidations::substate_id)
+            .do_update()
+            .set((
+                substate_cache_invalidations::state_version.eq(state_version.as_u64() as i64),
+                // A floor only ever rises. The transitions of one batch arrive in no stated order,
+                // and a destroy of the version below a creation must not lower what the creation
+                // showed.
+                substate_cache_invalidations::substate_version.eq(diesel::dsl::sql::<diesel::sql_types::Integer>(
+                    "max(substate_version, excluded.substate_version)",
+                )),
+                // The provenance belongs to whichever version the floor ends up holding, so it
+                // follows that same comparison rather than being overwritten. At the one version
+                // both a creation and a destroy can show, a spend stands: it is the later of the
+                // two whatever order they arrive in.
+                substate_cache_invalidations::spent.eq(diesel::dsl::sql::<diesel::sql_types::Bool>(
+                    "case when excluded.substate_version > substate_version then excluded.spent when \
+                     excluded.substate_version = substate_version then (spent or excluded.spent) else spent end",
+                )),
+                substate_cache_invalidations::invalidated_at.eq(now),
+            ))
+            .execute(self.connection())
+            .map_err(|e| StorageError::general(OPERATION, e))?;
+
+        Ok(retired)
     }
 }

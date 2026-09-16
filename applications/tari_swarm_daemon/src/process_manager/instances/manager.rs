@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, anyhow};
 use indexmap::IndexMap;
-use log::info;
+use log::{debug, info};
 use slug::slugify;
 use tari_ootle_wallet_sdk::Network;
 use tokio::{
@@ -24,9 +24,29 @@ use tokio::{
 };
 
 use super::InstanceId;
+
+/// Written to the swarm directory when there is no constants file there. Everything is commented
+/// out, so it changes nothing until a line is uncommented, and it lists what may be changed without
+/// having to go and look.
+const CONSENSUS_CONSTANTS_TEMPLATE: &str = r#"# Consensus constants for this swarm, read once at
+# start-up by every node in it. Only LocalNet reads this file at all. Uncomment a line to change it
+# and restart the swarm; anything left commented keeps the network's own value.
+#
+# Every value below is the one this network already uses, so uncommenting a line as it stands changes
+# nothing. The number of committees is the registered validator count divided by the committee size,
+# so a smaller committee splits the shard space across fewer nodes.
+# committee_size_per_shard_group = 7
+
+# pacemaker_block_time_secs = 10
+# base_layer_confirmations = 3
+# missed_proposal_suspend_threshold = 5
+# missed_proposal_recovery_threshold = 5
+# max_transaction_validity_epochs = 2160
+"#;
 use crate::{
     config::{InstanceConfig, InstanceType},
-    process_definitions::{ProcessContext, get_definition},
+    logger::FORWARDED_TARGET,
+    process_definitions::{CONSENSUS_CONSTANTS_FILE_NAME, ProcessContext, get_definition},
     process_manager::{
         AllocatedPorts,
         IndexerProcess,
@@ -79,6 +99,7 @@ impl InstanceManager {
 
     /// Fork all defined processes in order
     pub async fn fork_all(&mut self, executables: Executables<'_>) -> anyhow::Result<()> {
+        self.write_consensus_constants_template().await?;
         for mut instance in self.config.clone() {
             let executable = executables.get(instance.execution_instance_type()).ok_or_else(|| {
                 anyhow!(
@@ -101,6 +122,25 @@ impl InstanceManager {
                 .await?;
             }
         }
+        Ok(())
+    }
+
+    /// Writes a commented consensus constants file into the swarm directory if there is not one
+    /// already. Every node forked here is pointed at it, so a devnet is retuned by uncommenting a
+    /// line and restarting rather than by finding out where the setting lives.
+    async fn write_consensus_constants_template(&self) -> anyhow::Result<()> {
+        let path = self.base_path.join(CONSENSUS_CONSTANTS_FILE_NAME);
+        if fs::try_exists(&path).await.unwrap_or(false) {
+            return Ok(());
+        }
+
+        fs::create_dir_all(&self.base_path)
+            .await
+            .context("create_dir_all for the consensus constants file")?;
+        fs::write(&path, CONSENSUS_CONSTANTS_TEMPLATE)
+            .await
+            .context("write the consensus constants file")?;
+        log::info!("📝 Wrote consensus constants file {}", path.display());
         Ok(())
     }
 
@@ -196,6 +236,7 @@ impl InstanceManager {
             &instance_envs,
             base_path.clone(),
             processes_path,
+            self.base_path.clone(),
             self.network,
             listen_ip,
             &mut allocated_ports,
@@ -219,7 +260,7 @@ impl InstanceManager {
             .stderr(Stdio::piped())
             // Any attempt to use stdin will fail immediately
             .stdin(Stdio::null());
-        info!("Command: {:?}", command);
+        debug!("Command: {:?}", command);
         let mut child = command.spawn().with_context(|| format!("spawn {instance_type}"))?;
 
         self.port_allocator.register(instance_id, allocated_ports.clone());
@@ -240,6 +281,7 @@ impl InstanceManager {
             // This saves us from having to join the network string to the path all over the place, since everything we
             // want is under {base_dir}/{network}
             base_path.join(self.network.to_string()),
+            base_path,
             instance_envs,
             instance_settings,
         );
@@ -378,6 +420,7 @@ impl InstanceManager {
             .find(|i| i.id() == id)
             .ok_or_else(|| anyhow!("Instance not found"))?;
 
+        info!("🛑 Stopping {} (id: {})", instance.instance_type(), instance.id());
         instance.terminate().await?;
         instance.check_running()?;
         Ok(())
@@ -513,7 +556,7 @@ fn forward_logs<R: AsyncRead + Unpin + Send + 'static>(path: PathBuf, reader: R,
             },
         };
         while let Some(output) = lines.next_line().await.unwrap() {
-            log::debug!(target: "swarm", "[{target}] {output}");
+            log::debug!(target: FORWARDED_TARGET, "[{target}] {output}");
             if let Err(err) = log_file.write_all(output.as_bytes()).await {
                 log::error!("forward_logs: {err}");
                 return;
@@ -527,6 +570,6 @@ fn forward_logs<R: AsyncRead + Unpin + Send + 'static>(path: PathBuf, reader: R,
                 return;
             }
         }
-        log::debug!(target: "swarm", "Process exited ({target})");
+        log::debug!(target: FORWARDED_TARGET, "Process exited ({target})");
     });
 }

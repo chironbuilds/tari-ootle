@@ -307,9 +307,9 @@ pub struct QueryTransactionEventsRequest {
     pub topic: Option<String>,
     #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
     pub substate_id: Option<SubstateId>,
-    /// Filter by resource address. Matches when either the event's `substate_id` is the given
-    /// resource (std.resource.* events) or the event payload contains a `resource_address` entry
-    /// equal to the given address (std.vault.deposit / std.vault.withdraw).
+    /// Filter by resource address. Matches the events whose `substate_id` is that resource, which
+    /// is the `std.resource.*` family. Vault events name no resource — filter those by
+    /// `substate_id`, the vault's ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
     pub resource_address: Option<ResourceAddress>,
@@ -335,9 +335,9 @@ pub struct StreamTransactionEventsRequest {
     pub substate_id: Option<SubstateId>,
     #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
     pub template_address: Option<TemplateAddress>,
-    /// Filter by resource address. Matches when either the event's `substate_id` is the given
-    /// resource (std.resource.* events) or the event payload contains a `resource_address` entry
-    /// equal to the given address (std.vault.deposit / std.vault.withdraw).
+    /// Filter by resource address. Matches the events whose `substate_id` is that resource, which
+    /// is the `std.resource.*` family. Vault events name no resource — filter those by
+    /// `substate_id`, the vault's ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "utoipa", schema(value_type = Option<String>))]
     pub resource_address: Option<ResourceAddress>,
@@ -639,8 +639,12 @@ pub struct UtxoUpdateSet {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct UtxoStateUpdateSet {
     pub updates: Vec<WalletUtxoUpdate>,
+    /// The highest state version in `updates`. Every update at that version is included, so it is a
+    /// resume point: a later request filtering on `state_version > max_state_version` loses nothing.
     pub max_state_version: StateVersion,
     pub max_epoch: Epoch,
+    /// The shard holds further updates above `max_state_version`.
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -820,6 +824,7 @@ pub struct ValidatorStatus {
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export, export_to = "tari-indexer-client/"))]
 #[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub enum ValidatorConsensusState {
+    Initialising,
     Idle,
     CheckSync,
     Syncing,
@@ -964,11 +969,11 @@ pub struct GetNetworkEconomicsResponse {
     /// Kept as a cross-check against `receipt_exhaust_burned`.
     #[cfg_attr(feature = "utoipa", schema(value_type = String))]
     pub total_exhaust_burned: Amount,
-    /// Total pre-burn execution fees `F`, summed from transaction receipts.
+    /// Total fees paid by transaction payers, summed from transaction receipts.
     #[cfg_attr(feature = "utoipa", schema(value_type = String))]
     pub fee_volume: Amount,
     /// Total exhaust burned summed from the same receipts as `fee_volume`; `receipt_exhaust_burned /
-    /// fee_volume` is the exact realized burn rate, and this is the burn netted from `total_supply`. May
+    /// fee_volume` is the exact realized burn share, and this is the burn netted from `total_supply`. May
     /// transiently trail `total_exhaust_burned` while the receipt sync frontier catches up to the checkpoint
     /// frontier.
     #[cfg_attr(feature = "utoipa", schema(value_type = String))]
@@ -978,7 +983,7 @@ pub struct GetNetworkEconomicsResponse {
     pub total_supply: Amount,
     /// Number of transaction receipts the indexer has stored.
     pub transaction_receipt_count: u64,
-    /// The target exhaust burn rate in basis points in effect at `current_epoch`.
+    /// The share of collected fees burned rather than paid to leaders, in basis points, in effect at `current_epoch`.
     pub target_burn_rate_bps: u16,
 }
 

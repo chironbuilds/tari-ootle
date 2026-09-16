@@ -9,7 +9,10 @@ use tari_engine_types::{
     component::derive_component_address_from_public_key,
     confidential::{AbridgedTransactionKernel, EncodedMerkleProof, MinotariBurnClaimProof},
 };
-use tari_ootle_common_types::{SubstateRequirement, optional::Optional};
+use tari_ootle_common_types::{
+    SubstateRequirement,
+    optional::{IsNotFoundError, Optional},
+};
 use tari_ootle_transaction::TransactionId;
 use tari_ootle_wallet_sdk::{
     WalletSdk,
@@ -175,6 +178,31 @@ pub(super) fn not_found<T: Display>(details: T) -> anyhow::Error {
     .into()
 }
 
+/// Answers a missing thing with the JSON-RPC not-found code rather than as a general error.
+///
+/// A caller asking for something that does not exist yet - an account it has just created, an input
+/// whose creating transaction has not reached the indexer - has to be able to tell that apart from
+/// the wallet failing. Only the first is worth retrying, and a general error tells it the opposite.
+///
+/// The distinction is already carried by [`IsNotFoundError`]; this puts it where the JSON-RPC layer
+/// reads it, keeping the error's own message. Named for that layer because that is the whole of what
+/// it does: the error it produces means something only to a JSON-RPC caller.
+pub(super) trait OrJrpcNotFound<T> {
+    fn or_jrpc_not_found(self) -> Result<T, anyhow::Error>;
+}
+
+impl<T, E: IsNotFoundError + Into<anyhow::Error>> OrJrpcNotFound<T> for Result<T, E> {
+    fn or_jrpc_not_found(self) -> Result<T, anyhow::Error> {
+        self.map_err(|e| {
+            if e.is_not_found_error() {
+                not_found(e.into())
+            } else {
+                e.into()
+            }
+        })
+    }
+}
+
 pub(super) fn invalid_request<T: Display>(details: T) -> anyhow::Error {
     application_error(
         ApplicationErrorCode::InvalidRequest,
@@ -253,4 +281,48 @@ pub(crate) fn complete_burn_proof_to_contents(proof: CompleteClaimBurnProof) -> 
         },
         encrypted_data,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use axum_jrpc::error::{JsonRpcError, JsonRpcErrorReason};
+
+    use super::*;
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    struct TestError(&'static str);
+
+    impl IsNotFoundError for TestError {
+        fn is_not_found_error(&self) -> bool {
+            self.0 == "missing"
+        }
+    }
+
+    fn is_not_found_code(e: &anyhow::Error) -> bool {
+        matches!(
+            e.downcast_ref::<JsonRpcError>().map(|e| e.error_reason()),
+            Some(JsonRpcErrorReason::ApplicationError(code)) if code == ApplicationErrorCode::NotFound as i32
+        )
+    }
+
+    #[test]
+    fn a_not_found_error_keeps_its_message() {
+        let err = Result::<(), _>::Err(TestError("missing"))
+            .or_jrpc_not_found()
+            .unwrap_err();
+        assert!(is_not_found_code(&err));
+        // The error keeps its own message rather than being flattened to "not found".
+        assert!(err.to_string().contains("missing"));
+    }
+
+    /// Only a missing resource is retryable, so nothing else may be reported as one.
+    #[test]
+    fn any_other_failure_is_left_alone() {
+        let err = Result::<(), _>::Err(TestError("broken"))
+            .or_jrpc_not_found()
+            .unwrap_err();
+        assert!(!is_not_found_code(&err));
+        assert!(err.downcast_ref::<TestError>().is_some());
+    }
 }

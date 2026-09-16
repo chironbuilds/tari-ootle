@@ -20,6 +20,7 @@ use tari_ootle_common_types::{
     VersionedSubstateId,
     VotePower,
     committee::{Committee, CommitteeInfo},
+    optional::Optional,
 };
 use tari_ootle_storage::{StorageError, global::models::ValidatorNode};
 use tari_template_lib_types::crypto::RistrettoPublicKeyBytes;
@@ -55,6 +56,15 @@ pub struct TestEpochManager {
     /// `last_epoch_hash`. Like the lag fields, a fresh `Arc` is allocated per validator by
     /// `clone_for`.
     oracle_epoch_hash_override: Arc<StdMutex<Option<FixedHash>>>,
+    /// Epochs whose boundary block this validator's oracle has scanned but whose activation it has
+    /// not applied. `get_observed_epoch_hash` answers for these even while `get_epoch_hash` — the
+    /// activated view, gated by `oracle_visible_epoch` — reports `NoEpochFound`.
+    ///
+    /// Production keeps the two apart: the activated row wins, and the oracle's scanned boundary is
+    /// the fallback. Separating them here is what lets a test hold a validator in the state where it
+    /// can ratify an `EndEpoch` but cannot yet open the next epoch. Like the lag fields, a fresh
+    /// `Arc` is allocated per validator by `clone_for`.
+    oracle_observed_boundaries: Arc<StdMutex<HashSet<Epoch>>>,
 }
 
 impl TestEpochManager {
@@ -67,6 +77,7 @@ impl TestEpochManager {
             oracle_visible_epoch: Arc::new(StdMutex::new(None)),
             oracle_current_epoch_cap: Arc::new(StdMutex::new(None)),
             oracle_epoch_hash_override: Arc::new(StdMutex::new(None)),
+            oracle_observed_boundaries: Arc::new(StdMutex::new(HashSet::new())),
         }
     }
 
@@ -81,6 +92,11 @@ impl TestEpochManager {
     /// once a node catches up via sync.
     pub fn set_oracle_visible_epoch(&self, epoch: Epoch) {
         *self.oracle_visible_epoch.lock().unwrap() = Some(epoch);
+    }
+
+    /// Remove the oracle view cap for this validator, standing in for its scanner catching up.
+    pub fn clear_oracle_visible_epoch(&self) {
+        *self.oracle_visible_epoch.lock().unwrap() = None;
     }
 
     fn oracle_visible_epoch(&self) -> Option<Epoch> {
@@ -117,11 +133,25 @@ impl TestEpochManager {
         *self.oracle_epoch_hash_override.lock().unwrap()
     }
 
+    /// Mark `epoch`'s boundary block as scanned by this validator's oracle without activating the
+    /// epoch. `get_observed_epoch_hash(epoch)` then reports the boundary hash — enough to ratify an
+    /// `EndEpoch` — while a `set_oracle_visible_epoch` cap keeps `get_epoch_hash(epoch)` answering
+    /// `NoEpochFound`, so the node still cannot open the epoch. That pair is the real state of a node
+    /// mid-catch-up, and the two must be settable independently.
+    pub fn set_oracle_observed_boundary(&self, epoch: Epoch) {
+        self.oracle_observed_boundaries.lock().unwrap().insert(epoch);
+    }
+
+    fn has_oracle_observed_boundary(&self, epoch: Epoch) -> bool {
+        self.oracle_observed_boundaries.lock().unwrap().contains(&epoch)
+    }
+
     pub async fn set_current_epoch(&mut self, current_epoch: Epoch, shard_group: ShardGroup) -> &Self {
         self.current_epoch = current_epoch;
         {
             let mut lock = self.inner.lock().await;
             lock.current_epoch = current_epoch;
+            lock.epoch_started = true;
         }
 
         let _ = self.tx_epoch_events.send(EpochManagerEvent::EpochChanged {
@@ -150,6 +180,7 @@ impl TestEpochManager {
         copy.oracle_visible_epoch = Arc::new(StdMutex::new(None));
         copy.oracle_current_epoch_cap = Arc::new(StdMutex::new(None));
         copy.oracle_epoch_hash_override = Arc::new(StdMutex::new(None));
+        copy.oracle_observed_boundaries = Arc::new(StdMutex::new(HashSet::new()));
         if let Some(our_validator_node) = self.our_validator_node.clone() {
             copy.our_validator_node = Some(ValidatorNode {
                 address,
@@ -221,10 +252,6 @@ impl TestEpochManager {
     pub fn get_current_epoch(&self) -> Epoch {
         self.current_epoch
     }
-
-    pub async fn eviction_proofs(&self) -> Vec<tari_sidechain::EvictionProof> {
-        self.state_lock().await.eviction_proofs.clone()
-    }
 }
 
 impl EpochManagerReader for TestEpochManager {
@@ -232,6 +259,20 @@ impl EpochManagerReader for TestEpochManager {
 
     fn subscribe(&self) -> broadcast::Receiver<EpochManagerEvent> {
         self.tx_epoch_events.subscribe()
+    }
+
+    async fn is_this_validator_registered_for_epoch(&self, epoch: Epoch) -> Result<bool, EpochManagerError> {
+        if !self.state_lock().await.epoch_started {
+            return Ok(false);
+        }
+        if self.current_epoch().await? < epoch {
+            return Ok(false);
+        }
+        match self.get_local_committee_info(epoch).await {
+            Ok(_) => Ok(true),
+            Err(err) if err.is_not_registered_error() => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     async fn get_committee_for_substate(
@@ -432,15 +473,6 @@ impl EpochManagerReader for TestEpochManager {
         Ok(())
     }
 
-    async fn add_intent_to_evict_validator(
-        &self,
-        proof: tari_sidechain::EvictionProof,
-    ) -> Result<(), EpochManagerError> {
-        let mut state = self.state_lock().await;
-        state.eviction_proofs.push(proof);
-        Ok(())
-    }
-
     async fn get_random_committee_member(
         &self,
         _epoch: Epoch,
@@ -502,8 +534,19 @@ impl EpochManagerReader for TestEpochManager {
         Ok(())
     }
 
-    async fn is_within_epoch_end_spread(&self, _current_epoch: Epoch) -> Result<bool, EpochManagerError> {
-        Ok(false)
+    async fn get_observed_epoch_hash(&self, epoch: Epoch) -> Result<Option<FixedHash>, EpochManagerError> {
+        // Mirrors the production ordering: an activated epoch's stored hash wins, otherwise fall back
+        // to a boundary the oracle has scanned but not yet activated.
+        if let Some(activated) = self.get_epoch_hash(epoch).await.optional()? {
+            return Ok(Some(activated));
+        }
+        if !self.has_oracle_observed_boundary(epoch) {
+            return Ok(None);
+        }
+        if let Some(hash) = self.oracle_epoch_hash_override() {
+            return Ok(Some(hash));
+        }
+        Ok(Some(self.inner.lock().await.last_epoch_hash))
     }
 
     async fn get_birthday_epoch(&self) -> Result<Option<Epoch>, EpochManagerError> {
@@ -514,23 +557,25 @@ impl EpochManagerReader for TestEpochManager {
 #[derive(Debug, Clone)]
 pub struct TestEpochManagerState {
     pub current_epoch: Epoch,
+    /// Validators must not leave the idle state until the test calls `set_current_epoch`, otherwise a
+    /// validator spawned early runs its pacemaker against peers that do not exist yet.
+    pub epoch_started: bool,
     pub last_epoch_hash: FixedHash,
     #[allow(clippy::type_complexity)]
     pub validator_nodes: HashMap<TestAddress, (ValidatorNode<TestAddress>, ShardGroup)>,
     pub committees: HashMap<ShardGroup, Arc<Committee<TestAddress>>>,
     pub address_shard: HashMap<TestAddress, ShardGroup>,
-    pub eviction_proofs: Vec<tari_sidechain::EvictionProof>,
 }
 
 impl Default for TestEpochManagerState {
     fn default() -> Self {
         Self {
             current_epoch: Epoch(1),
+            epoch_started: false,
             last_epoch_hash: FixedHash::default(),
             validator_nodes: HashMap::new(),
             committees: HashMap::new(),
             address_shard: HashMap::new(),
-            eviction_proofs: Vec::new(),
         }
     }
 }

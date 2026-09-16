@@ -40,6 +40,7 @@ impl<'a, TStore: StateReader> Authorization<'a, TStore> {
             })?;
         let component = self.state.get_component(locked)?;
         let scope = self.state.current_call_scope()?.auth_scope();
+
         if check_ownership(self.state, scope, component.as_ownership())? {
             // Owner can call any component method
             return Ok(());
@@ -54,9 +55,8 @@ impl<'a, TStore: StateReader> Authorization<'a, TStore> {
                     details: format!("Expected a component address, got {}", locked.substate_id()),
                 })?;
 
-        // Check access rules
         let access_rule = component.access_rules().get_method_access_rule(method);
-        if !self.check_access_rule(access_rule)? {
+        if !check_access_rule(self.state, scope, access_rule)? {
             return Err(RuntimeError::AccessDenied {
                 action_ident: ActionIdent::ComponentCallMethod {
                     component_address,
@@ -97,18 +97,21 @@ impl<'a, TStore: StateReader> Authorization<'a, TStore> {
         check_access_rule(self.state, scope, rule)
     }
 
-    /// Returns `true` if the current call scope satisfies the given ownership rule.
+    /// Returns `true` if the current frame satisfies `ownership`. Every authorization check is evaluated against the
+    /// current frame's scope: a component's own frame is already on top of the stack when its ownership rule is
+    /// checked, and that scope carries its caller's identity as virtual badges.
     pub fn check_ownership(&self, ownership: Ownership<'_>) -> Result<bool, RuntimeError> {
         let scope = self.state.current_call_scope()?.auth_scope();
         check_ownership(self.state, scope, ownership)
     }
 
+    /// Requires that the current frame satisfies `ownership`.
     pub fn require_ownership<A: Into<ActionIdent>>(
         &self,
         action: A,
         ownership: Ownership<'_>,
     ) -> Result<(), RuntimeError> {
-        if !check_ownership(self.state, self.state.current_call_scope()?.auth_scope(), ownership)? {
+        if !self.check_ownership(ownership)? {
             return Err(RuntimeError::AccessDeniedOwnerRequired { action: action.into() });
         }
         Ok(())
@@ -258,10 +261,21 @@ fn check_requirement<TStore: StateReader>(
 
             Ok(false)
         },
+        // `ScopedToComponent` / `ScopedToTemplate` mean "execution is within this component/template":
+        // they always describe the current (top) frame, which is the actor on resource/ownership checks
+        // and the callee on method checks.
         RuleRequirement::ScopedToComponent(address) => Ok(state.current_component()? == Some(*address)),
         RuleRequirement::ScopedToTemplate(address) => {
             let current = state.current_template()?;
             Ok(current == address)
+        },
+        // Sugar for the caller badges the engine stamps into a frame's scope at push. Both badge resources are
+        // empty by invariant, so the scope's badges are the only thing that can satisfy these.
+        RuleRequirement::CallerComponent(address) => {
+            Ok(scope.contains_badge(&NonFungibleAddress::caller_component_badge(*address)))
+        },
+        RuleRequirement::DirectCallerTemplate(address) => {
+            Ok(scope.contains_badge(&NonFungibleAddress::direct_caller_template_badge(*address)))
         },
     }
 }

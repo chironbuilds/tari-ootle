@@ -88,6 +88,18 @@ impl Transaction {
         }
     }
 
+    /// Bytes this transaction occupies in its canonical CBOR encoding.
+    ///
+    /// This is the figure the network moves and stores: the p2p `Transaction` message carries the
+    /// transaction as a single `bor_encoded` field, and the state store persists the same bytes. It
+    /// is a pure function of the transaction, so every node computes the same number and can enforce
+    /// a byte limit on it without diverging.
+    ///
+    /// Computed from the derived `CborLen` rather than by encoding, so nothing is allocated.
+    pub fn encoded_size(&self) -> usize {
+        tari_bor::encoded_len(self)
+    }
+
     pub fn is_dry_run(&self) -> bool {
         match self {
             Transaction::V1(tx) => tx.is_dry_run(),
@@ -264,12 +276,21 @@ impl Transaction {
         self.has_publish_template()
     }
 
+    /// The binary each `PublishTemplate` instruction carries, across both instruction lists so that
+    /// this agrees with [`Self::has_publish_template`] about what counts as a publish.
+    ///
+    /// A `PublishTemplate` whose blob index does not resolve yields nothing here. Dangling indices
+    /// are `validate_blob_references`' to reject, so a caller checking a property of the binaries
+    /// must not read an empty iterator as "no publish".
     pub fn publish_templates_iter(&self) -> impl Iterator<Item = &[u8]> + '_ {
         let blobs = self.unsealed_transaction().unsigned_transaction().blobs();
-        self.instructions().iter().filter_map(move |i| match i {
-            Instruction::PublishTemplate { binary, .. } => blobs.get(*binary).map(|b| b.as_bytes()),
-            _ => None,
-        })
+        self.instructions()
+            .iter()
+            .chain(self.fee_instructions())
+            .filter_map(move |i| match i {
+                Instruction::PublishTemplate { binary, .. } => blobs.get(*binary).map(|b| b.as_bytes()),
+                _ => None,
+            })
     }
 
     pub fn num_inputs(&self) -> usize {

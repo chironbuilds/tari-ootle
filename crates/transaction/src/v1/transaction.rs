@@ -6,8 +6,10 @@ use std::{collections::HashSet, fmt::Display, iter};
 use indexmap::IndexSet;
 use log::*;
 use tari_engine_types::{
+    fees::LITERAL_BYTE_DIVISOR,
     hashing::{EngineHashDomainLabel, hash_template_code, hasher32},
     indexed_value::IndexedValueError,
+    limits::STEALTH_LIMITS,
     published_template::PublishedTemplateAddress,
     substate::SubstateId,
 };
@@ -30,7 +32,7 @@ use crate::{
     args::InstructionArg,
     v1::{
         intent::calculate_intent_commitment_v1,
-        signature::{TransactionSignature, TransactionSignatureFields},
+        signature::{TransactionSignature, TransactionSignatureFields, verify_sealed_batch},
     },
     weight::TransactionWeight,
 };
@@ -39,14 +41,31 @@ const LOG_TARGET: &str = "tari::ootle::transaction::transaction";
 
 /// Maximum number of authorization signatures a transaction may carry.
 ///
-/// Each signature costs one Ristretto Schnorr verification, performed by every node that receives
-/// the transaction, before any fee is charged. Transaction weight alone bounds this too loosely —
-/// at `SIGNER_FACTOR` weight per signer the per-transaction weight cap permits signature counts in
-/// the hundreds of thousands — so the count is capped directly. The ceiling is well above any
-/// multi-party authorization scheme, which names its signers explicitly; authorization by a large
-/// or open-ended group is expressed through a component's access rules, not through raw
-/// transaction signatures.
-pub const MAX_SIGNATURES_PER_TRANSACTION: usize = 16;
+/// The signatures are verified by every node that receives the transaction, before any fee is
+/// charged, so the count is capped directly: at `SIGNER_FACTOR` weight per signer the
+/// per-transaction weight cap alone would permit signature counts in the hundreds of thousands.
+///
+/// Set to the stealth input ceiling ([`STEALTH_LIMITS`]`.max_total_inputs_per_transaction`), because
+/// that is what needs the signatures. A key-path stealth spend proves ownership of each input with
+/// its own one-time key, whose badge must be in the transaction's authorization scope
+/// (`verify_input_authorizations`), so spending n stealth inputs takes n distinct signatures — all n
+/// as authorizations when the account key seals, or one of them promoted to the seal. A cap below
+/// the input ceiling would make *this* the binding limit on a multi-input spend or a coinjoin, which
+/// is not the limit anyone reasons about — so the two are one definition rather than two constants
+/// kept in step.
+///
+/// Whole-set batch verification is what makes a ceiling this high affordable: the cost per signature
+/// *falls* as a set grows (~15.6µs at the cap against ~46µs for a lone signature, measured in
+/// `tari_ootle_transaction`'s `signature_verification` bench), so a transaction at the cap costs
+/// ~16ms to verify, and the cheapest CPU an attacker can buy per gossiped byte is a transaction with
+/// *few* signatures rather than one at the cap.
+///
+/// What bounds the aggregate is weight, not this. A block's signature count is bounded by
+/// `max_block_validation_weight` at `SIGNER_FACTOR` each — a consensus rule, enforced on receive —
+/// and a single transaction's share of a block by `max_block_weight`. A spend at the cap declares an
+/// input per signature, so weight is what stops it monopolising a block:
+/// `the_block_budget_admits_a_transaction_at_the_signature_cap` is where that headroom is pinned.
+pub const MAX_SIGNATURES_PER_TRANSACTION: usize = STEALTH_LIMITS.max_total_inputs_per_transaction;
 
 static XTR_REQUIREMENT: SubstateRequirement = SubstateRequirement::new(SubstateId::Resource(TARI_TOKEN), None);
 
@@ -108,13 +127,27 @@ impl TransactionV1 {
         // Derived once and shared between the seal and the authorization messages: deriving blob
         // commitments hashes every blob payload.
         let blob_hashes = self.body.unsigned_transaction().blobs.hashes();
-        if !self.seal_signature.verify_v1_with_blob_hashes(&self.body, &blob_hashes) {
-            debug!(target: LOG_TARGET, "Transaction seal signature is invalid");
-            return false;
-        }
+        let seal_message = TransactionSealSignature::create_message_v1_with_blob_hashes(&self.body, &blob_hashes);
+        let authorization_message = TransactionSignature::create_message_v1_with_blob_hashes(
+            self.seal_signature.public_key(),
+            self.body.unsigned_transaction(),
+            &blob_hashes,
+        );
 
-        self.body
-            .verify_all_signatures_with_blob_hashes(self.seal_signature.public_key(), &blob_hashes)
+        if verify_sealed_batch(
+            &self.seal_signature,
+            seal_message,
+            self.body.signatures(),
+            authorization_message,
+        ) {
+            return true;
+        }
+        debug!(
+            target: LOG_TARGET,
+            "Transaction signatures are invalid: the seal or at least one of its {} authorizations does not verify",
+            self.body.signatures().len(),
+        );
+        false
     }
 
     pub(crate) fn inputs(&self) -> &IndexSet<SubstateRequirement> {
@@ -337,12 +370,11 @@ fn calc_instruction_weight(instruction: &Instruction) -> u64 {
             access_rules,
             bucket_workspace_id: workspace_id,
             ..
-        } => {
-            access_rules.as_ref().map(|a| a.num_access_rules() as u64).unwrap_or(0) +
-                workspace_id.as_ref().map(|_| 1).unwrap_or(0)
-        },
-        Instruction::CallFunction { args, .. } => calc_args_weight(args),
-        Instruction::CallMethod { args, .. } => calc_args_weight(args),
+        } => (access_rules.as_ref().map(|a| a.num_access_rules() as u64).unwrap_or(0) +
+            workspace_id.as_ref().map(|_| 1).unwrap_or(0))
+        .max(INVOCATION_FLOOR),
+        Instruction::CallFunction { args, .. } => calc_args_weight(args).max(INVOCATION_FLOOR),
+        Instruction::CallMethod { args, .. } => calc_args_weight(args).max(INVOCATION_FLOOR),
         Instruction::PutLastInstructionOutputOnWorkspace { .. } => 0, // Call already costs
         Instruction::ClaimBurn { .. } => CLAIM_FIXED_COST,
         Instruction::ClaimValidatorFees { .. } => 1,
@@ -357,7 +389,7 @@ fn calc_instruction_weight(instruction: &Instruction) -> u64 {
         Instruction::StealthTransfer { statement, .. } => calc_stealth_statement_weight(statement),
         Instruction::PayFeeFromBucket { .. } => 1,
         Instruction::UpdateComponentTemplate { migrate, .. } => {
-            1 + migrate.as_ref().map(|m| calc_args_weight(&m.args)).unwrap_or(0)
+            (1 + migrate.as_ref().map(|m| calc_args_weight(&m.args)).unwrap_or(0)).max(INVOCATION_FLOOR)
         },
     }
 }
@@ -375,7 +407,7 @@ fn calc_stealth_statement_weight(statement: &StealthTransferStatement) -> u64 {
         .inputs_statement
         .inputs
         .iter()
-        .map(|i| tari_bor::encoded_len(&i.witness).unwrap_or(0) as u64)
+        .map(|i| tari_bor::encoded_len(&i.witness) as u64)
         .sum();
 
     // Fixed cost of a transfer (resource lock, balance-proof verification, basic validation).
@@ -392,13 +424,24 @@ fn calc_stealth_statement_weight(statement: &StealthTransferStatement) -> u64 {
         witness_bytes / SPEND_WITNESS_BYTE_DIVISOR
 }
 
-/// Inline literal args carry their bytes directly in the instruction, so they are priced by size,
-/// consistent with blob/log byte costing. Applied once across an instruction's whole literal
-/// payload.
+/// Least weight a template invocation may carry, whatever its arguments come to.
 ///
-/// Public because the dry-run fee allowance is derived from it: the encoded width of the `max_fee`
-/// literal is the one term that can make a real run weigh more than the dry run that estimated it.
-pub const LITERAL_BYTE_DIVISOR: u64 = 3;
+/// A call with no arguments weighs nothing by argument alone, so without a floor
+/// `max_transaction_weight` bounds a transaction's bytes but not the number of invocations it
+/// packs — and every invocation instantiates the template afresh
+/// ([`tari_engine_types::limits::instantiation_points`]), which is real work before any of the
+/// template's own code runs. The execution-point budget is what prices that work; this floor is
+/// what keeps the weight cap a bound on instruction count at all.
+pub const INVOCATION_FLOOR: u64 = 30;
+
+/// Smallest number of encoded bytes an instruction that invokes a template can occupy — a
+/// `CallMethod` naming its component by workspace slot rather than by address, which is the whole
+/// instruction in ten bytes. One `PutLastInstructionOutputOnWorkspace` followed by a run of these
+/// is a valid transaction, and every one of them instantiates a template.
+///
+/// Paired with [`INVOCATION_FLOOR`], this is what turns the transaction byte cap into a bound on
+/// invocation count. `no_invocation_encodes_smaller_than_the_recorded_minimum` keeps it honest.
+pub const MIN_INVOCATION_ENCODED_BYTES: usize = 10;
 
 fn calc_args_weight(args: &[InstructionArg]) -> u64 {
     // Workspace and blob refs are cheap — just an index. Blob payloads are charged at the
@@ -723,5 +766,89 @@ mod transaction_id_tests {
         );
 
         assert_ne!(a.calculate_id(), b.calculate_id());
+    }
+}
+
+#[cfg(test)]
+mod weight_tests {
+    use tari_template_lib_types::{FunctionName, ObjectKey, TemplateAddress};
+
+    use super::*;
+    use crate::MigrateFunction;
+
+    /// The smallest invocation there is: the component comes from a workspace slot, so the
+    /// instruction carries no address at all.
+    fn workspace_call() -> Instruction {
+        Instruction::CallMethod {
+            call: crate::ComponentReference::Workspace(0),
+            method: FunctionName::try_from("m").expect("a one-character method name fits"),
+            args: vec![],
+        }
+    }
+
+    fn no_arg_call() -> Instruction {
+        Instruction::CallMethod {
+            call: ComponentAddress::new(ObjectKey::default()).into(),
+            method: FunctionName::try_from("m").expect("a one-character method name fits"),
+            args: vec![],
+        }
+    }
+
+    /// The permissionless shape: no owner rule, no access rules, no bucket. It still reaches
+    /// `invoke_template` in the processor, so it is an invocation like any other.
+    fn bare_create_account() -> Instruction {
+        Instruction::CreateAccount {
+            owner_public_key: tari_template_lib_types::crypto::RistrettoPublicKeyBytes::zero(),
+            owner_rule: None,
+            access_rules: None,
+            bucket_workspace_id: None,
+        }
+    }
+
+    /// A migration whose function takes no arguments: it still pushes a call frame and instantiates
+    /// the target template.
+    fn bare_template_update() -> Instruction {
+        Instruction::UpdateComponentTemplate {
+            component: ComponentAddress::new(ObjectKey::default()).into(),
+            new_template: TemplateAddress::default(),
+            migrate: Some(MigrateFunction {
+                name: FunctionName::try_from("m").expect("a one-character function name fits"),
+                args: vec![],
+            }),
+        }
+    }
+
+    /// An instruction carrying no arguments weighs nothing by argument alone, so the floor is what
+    /// stops a list of them from being free. Every instruction that reaches `invoke_template` in the
+    /// processor must carry it.
+    #[test]
+    fn every_instruction_that_invokes_a_template_weighs_the_floor() {
+        assert_eq!(calc_instruction_weight(&workspace_call()), INVOCATION_FLOOR);
+        assert_eq!(calc_instruction_weight(&no_arg_call()), INVOCATION_FLOOR);
+        assert_eq!(calc_instruction_weight(&bare_create_account()), INVOCATION_FLOOR);
+        assert_eq!(calc_instruction_weight(&bare_template_update()), INVOCATION_FLOOR);
+    }
+
+    /// `consensus_constants::the_weight_cap_bounds_the_instructions_the_size_cap_admits` reads this
+    /// back to check the floor against the byte cap, which lives in a crate downstream of this one,
+    /// so it has to be the smallest encoding of any instruction that invokes a template.
+    #[test]
+    fn no_invocation_encodes_smaller_than_the_recorded_minimum() {
+        for instruction in [
+            workspace_call(),
+            no_arg_call(),
+            bare_create_account(),
+            bare_template_update(),
+        ] {
+            let encoded = tari_bor::encode(&instruction).unwrap().len();
+            assert!(
+                encoded >= MIN_INVOCATION_ENCODED_BYTES,
+                "{instruction:?} encodes to {encoded} bytes"
+            );
+        }
+        assert_eq!(
+            tari_bor::encode(&workspace_call()).unwrap().len(),
+            MIN_INVOCATION_ENCODED_BYTES
+        );
     }
 }

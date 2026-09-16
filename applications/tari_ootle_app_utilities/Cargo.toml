@@ -11,7 +11,7 @@ tari_common = { workspace = true }
 tari_common_types = { workspace = true }
 tari_crypto = { workspace = true, features = ["serde"] }
 tari_ootle_common_types = { workspace = true }
-tari_engine = { workspace = true }
+tari_engine = { workspace = true, optional = true }
 tari_ootle_storage = { workspace = true }
 tari_epoch_oracles = { workspace = true, optional = true }
 ootle-network = { workspace = true }
@@ -43,13 +43,20 @@ tokio = { workspace = true, features = ["default", "macros", "time", "sync", "rt
 url = { workspace = true, features = ["serde"] }
 toml = { workspace = true }
 config = { workspace = true }
+# Only the consensus constants file needs the consensus engine, so it is behind a feature: nothing
+# that merely prices a transaction has to carry it.
+tari_consensus = { workspace = true, optional = true }
 
 [dev-dependencies]
 bounded-vec = { workspace = true }
-# Test-only, so nothing that prices a transaction has to carry the consensus engine: lets the
-# restated burn rate be pinned to the consensus constant rather than drifting from it.
-tari_consensus = { workspace = true }
+tempfile = { workspace = true }
 
 [features]
+default = ["execution"]
+# Executing a transaction needs the engine, and the engine needs wasmer, which has no cranelift
+# backend on Windows. The wallet daemon only prices and submits transactions, so it takes this
+# crate without the feature and stays buildable there.
+execution = ["dep:tari_engine"]
 p2p = ["tari_networking", "tari_ootle_p2p", "libp2p-identity", "multiaddr"]
 epoch_oracle = ["tari_epoch_oracles"]
+consensus_constants = ["tari_consensus"]

@@ -89,6 +89,7 @@ message BlockHeader {
   bytes epoch_hash = 12;
   ExtraData extra_data = 13;
   ShardGroupAccumulatedData accumulated_data = 14;
+  uint32 protocol_version = 15;
 }
 
 message Block {
@@ -120,6 +121,7 @@ message Command {
     TransactionAtom some_accept = 5;
 
     ForeignProposalAtom foreign_proposal = 6;
+    // Reserved: rejected on decode. Do not reuse field 8.
     EvictNodeAtom evict_node = 8;
     EndEpochAtom end_epoch = 9;
   }
@@ -261,6 +263,7 @@ message SyncRequest {
   uint64 block_height = 2;
 }
 
+// Reserved: rejected on decode. Retained so field 8 of Command stays occupied.
 message EvictNodeAtom {
   bytes public_key = 1;
 }

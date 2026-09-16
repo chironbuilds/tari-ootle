@@ -54,6 +54,7 @@ use tari_template_lib::{
         TransactionReceiptAddress,
         VaultId,
         crypto::PedersenCommitmentBytes,
+        engine_args::IntrinsicId,
     },
 };
 
@@ -110,12 +111,15 @@ pub enum RuntimeError {
     AddressAllocationNotInScope { id: AddressAllocationId },
     #[error("Encountered unknown or out of scope signer badge with public key {public_key}")]
     SignerBadgeNotInScope { public_key: RistrettoPublicKeyBytes },
-    #[error("Component not found with address '{address}'")]
-    ComponentNotFound { address: ComponentAddress },
     #[error("Layer one commitment not found with address '{address}'")]
     LayerOneCommitmentNotFound { address: ClaimedOutputTombstoneAddress },
     #[error("Invalid argument {argument}: {reason}")]
     InvalidArgument { argument: &'static str, reason: String },
+    #[error(
+        "Intrinsic {intrinsic} is not supported by this validator. The template requires a newer engine — validators \
+         and indexers must be upgraded before it can be called."
+    )]
+    IntrinsicNotSupported { intrinsic: IntrinsicId },
     #[error("Invalid number of arguments: expected {expected}, but got {len}")]
     InvalidNumberOfArguments { expected: usize, len: usize },
     #[error("Invalid amount '{amount}': {reason}")]
@@ -210,6 +214,22 @@ pub enum RuntimeError {
     WriteInReadOnlyContext,
     #[error("Host operation '{operation}' is forbidden inside a read-only (spend-script) context")]
     ForbiddenInReadOnlyContext { operation: &'static str },
+    #[error("Write to {id} attempted in a resource auth hook, which may only modify its own component state")]
+    WriteOutsideOwnComponent { id: SubstateId },
+    #[error("Host operation '{operation}' is forbidden inside a resource auth hook")]
+    ForbiddenInAuthHookContext { operation: &'static str },
+    #[error("Freeze on resource {resource_address} targeted vault {vault_id}, which holds resource {vault_resource}")]
+    FreezeResourceMismatch {
+        vault_id: VaultId,
+        resource_address: ResourceAddress,
+        vault_resource: ResourceAddress,
+    },
+    #[error("Recall on resource {resource_address} targeted vault {vault_id}, which holds resource {vault_resource}")]
+    RecallResourceMismatch {
+        vault_id: VaultId,
+        resource_address: ResourceAddress,
+        vault_resource: ResourceAddress,
+    },
     #[error("Spend script rejected the spend: {details}")]
     SpendScriptRejected { details: Box<RuntimeError> },
     #[error("Spend condition not met: {details}")]
@@ -252,6 +272,12 @@ pub enum RuntimeError {
          across transactions."
     )]
     MaxNativeExecutionPointsExceeded { consumed_points: u64, max_points: u64 },
+    #[error(
+        "Component state may not contain a {kind} ({id}): buckets, proofs and address allocations live only for the \
+         transaction that creates them"
+    )]
+    TransientValueInComponentState { kind: &'static str, id: String },
+
     #[error("No fees paid from stealth transfer: {details}")]
     NoFeesPaid { details: String },
     #[error("No fee checkpoint")]
@@ -283,8 +309,12 @@ pub enum RuntimeError {
     InvalidReturnValue(IndexedValueError),
     #[error("Attempt to pop auth scope stack but it was empty")]
     AuthScopeStackEmpty,
-    #[error("Invalid deposit of bucket {bucket_id} has locked value amounting to {locked_amount}")]
-    InvalidOpDepositLockedBucket { bucket_id: BucketId, locked_amount: Amount },
+    #[error("Cannot {op} bucket {bucket_id}: it has funds locked by a proof (revealed amount {locked_amount})")]
+    InvalidOpLockedBucket {
+        op: &'static str,
+        bucket_id: BucketId,
+        locked_amount: Amount,
+    },
     #[error("Duplicate substate {address}")]
     DuplicateSubstate { address: SubstateId },
     #[error("Substate {id} is orphaned")]
@@ -354,6 +384,15 @@ pub enum RuntimeError {
 }
 
 impl RuntimeError {
+    /// Names the transient value a component tried to persist. Takes the id as `impl Display` so that only the id
+    /// actually being reported is formatted.
+    pub fn transient_in_component_state(kind: &'static str, id: impl std::fmt::Display) -> Self {
+        Self::TransientValueInComponentState {
+            kind,
+            id: id.to_string(),
+        }
+    }
+
     pub fn to_reject_reason(&self, instruction_idx: Option<usize>) -> RejectReason {
         let instruction_prefix = if let Some(ref idx) = instruction_idx {
             format_args!("At instruction #{}: ", *idx)
@@ -376,25 +415,34 @@ impl RuntimeError {
             } => RejectReason::InsufficientFeesPaid(format!(
                 "{instruction_prefix}Insufficient fees paid: {fees_paid}, required fees: {required_fee}"
             )),
+            // The paid fee did not fund the compute the transaction used. Paying more is what fixes it, so it
+            // reports as a fee shortfall rather than as a failure of the code. `FeeIntentComputeExceeded` and
+            // `MaxNativeExecutionPointsExceeded` are flat ceilings that a larger fee does not raise, so they stay
+            // execution failures.
+            Self::InsufficientFeesForNativeExecution {
+                required_points,
+                consumed_points,
+                allowance,
+            } => RejectReason::InsufficientFeesPaid(format!(
+                "{instruction_prefix}Insufficient fees to fund native verification requiring {required_points} \
+                 points: {consumed_points} of {allowance} allowance points already consumed"
+            )),
             Self::FeePaymentInMainIntent => RejectReason::FeePaymentInMainIntent,
             err => RejectReason::ExecutionFailure(format!("{instruction_prefix}{err}")),
         }
     }
 }
 
+/// Only the absence of a substate counts as "not found". The runtime objects a transaction holds — buckets,
+/// proofs, vaults — go missing because a call is wrong about what is in scope, not because the ledger lacks
+/// something, and an `.optional()` that swallowed those would turn a scope error into a silent `None`.
 impl IsNotFoundError for RuntimeError {
     fn is_not_found_error(&self) -> bool {
-        matches!(
-            self,
-            RuntimeError::SubstateNotFound { .. } |
-                RuntimeError::ComponentNotFound { .. } |
-                RuntimeError::VaultNotFound { .. } |
-                RuntimeError::BucketNotFound { .. } |
-                RuntimeError::ResourceNotFound { .. } |
-                RuntimeError::NonFungibleNotFound { .. } |
-                RuntimeError::ProofNotFound { .. } |
-                RuntimeError::VirtualSubstateNotFound { .. }
-        )
+        match self {
+            RuntimeError::SubstateNotFound { .. } => true,
+            RuntimeError::StateStoreError(err) => err.is_not_found_error(),
+            _ => false,
+        }
     }
 }
 
@@ -432,12 +480,10 @@ pub enum TransactionCommitError {
          instruction"
     )]
     DanglingProofs { count: usize },
-    #[error("Locked value (amount: {locked_amount}) remaining in vault {vault_id}")]
+    #[error("Locked value (revealed amount: {locked_amount}) remaining in vault {vault_id}")]
     DanglingLockedValueInVault { vault_id: VaultId, locked_amount: Amount },
     #[error("{count} dangling address allocations remain after transaction execution")]
     DanglingAddressAllocations { count: usize },
-    #[error("{count} dangling items in workspace after transaction execution")]
-    WorkspaceNotEmpty { count: usize },
     #[error(transparent)]
     StateStoreError(#[from] StateStoreError),
     #[error(transparent)]
@@ -477,14 +523,16 @@ pub enum ArgumentValidationError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LimitError {
-    #[error("Substate size of {size} bytes exceeds the maximum allowed size of {} bytes", limits::ENGINE_LIMITS.max_substate_size)]
-    SubstateSizeExceeded { size: usize },
+    #[error("Substate {id} of {size} bytes exceeds the maximum allowed size of {} bytes", limits::ENGINE_LIMITS.max_substate_size)]
+    SubstateSizeExceeded { id: SubstateId, size: usize },
     #[error("Log entry of {size} bytes exceeds maximum size of {} bytes", limits::ENGINE_LIMITS.max_log_size_bytes)]
     LogSizeExceeded { size: usize },
     #[error("Exceeded maximum number of logs per transaction: {}", limits::ENGINE_LIMITS.max_logs)]
     MaxLogsExceeded,
     #[error("Exceeded maximum number of events per transaction: {}", limits::ENGINE_LIMITS.max_events)]
     MaxEventsExceeded,
+    #[error("Event of {size} bytes exceeds maximum size of {} bytes", limits::ENGINE_LIMITS.max_event_size_bytes)]
+    EventSizeExceeded { size: usize },
     #[error("Requested random bytes length {len} exceeds maximum of {} bytes", limits::ENGINE_LIMITS.max_random_bytes_len)]
     MaxRandomBytesLenExceeded { len: usize },
 }

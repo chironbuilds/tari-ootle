@@ -2,7 +2,7 @@
 //   SPDX-License-Identifier: BSD-3-Clause
 use std::collections::{BTreeMap, HashMap};
 
-use tari_engine::runtime::{ActionIdent, LockError, RuntimeError};
+use tari_engine::runtime::{ActionIdent, RuntimeError};
 use tari_ootle_transaction::{Epoch, Transaction, args};
 use tari_template_lib::{
     args::ComponentAction,
@@ -21,7 +21,10 @@ use tari_template_lib::{
             ResourceAccessRules,
             ResourceAuthAction,
             RestrictedAccessRule,
+            RuleRequirement,
+            UpdateRule,
         },
+        constants::TARI_TOKEN,
         rule,
     },
 };
@@ -221,6 +224,115 @@ mod component_access_rules {
         assert_reject_reason(reason, RuntimeError::AccessDeniedOwnerRequired {
             action: ComponentAction::SetAccessRules.into(),
         });
+    }
+
+    #[test]
+    fn set_access_rules_rejects_scoped_requirement() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (owner_proof, _, owner_key) = test.create_owner_proof();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_configured_rules", args![
+                    OwnerRule::OwnedBySigner,
+                    ComponentAccessRules::new().default(AccessRule::AllowAll),
+                    ResourceAccessRules::new(),
+                    AccessRule::DenyAll,
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        // Build a rule set that bypasses the builder lint, the way a hand-written or non-Rust template
+        // could, and confirm the engine rejects it rather than installing a constant method rule.
+        let degenerate = component_access_rules_with_scoped_method_rule(component_address);
+        assert!(degenerate.contains_scoped_to_component_or_template());
+
+        let reason = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "set_component_access_rules", args![degenerate])
+                .build_and_seal(&owner_key),
+            vec![owner_proof],
+        );
+
+        assert_reject_reason(reason, RuntimeError::InvalidArgument {
+            argument: "access_rules",
+            reason: "component(..)/template(..) cannot be used on a component method access rule".to_string(),
+        });
+    }
+
+    #[test]
+    fn create_component_rejects_scoped_owner_rule() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (owner_proof, _, owner_key) = test.create_owner_proof();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_configured_rules", args![
+                    OwnerRule::OwnedBySigner,
+                    ComponentAccessRules::new().default(AccessRule::AllowAll),
+                    ResourceAccessRules::new(),
+                    AccessRule::DenyAll,
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+        let some_component = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        // A `component(..)` owner rule is constant on a component (its own frame is always on top), so the
+        // engine rejects it at creation rather than installing an "owned by everyone" rule.
+        let reason = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_configured_rules", args![
+                    OwnerRule::ByAccessRule(rule!(component(some_component))),
+                    ComponentAccessRules::new().default(AccessRule::AllowAll),
+                    ResourceAccessRules::new(),
+                    AccessRule::DenyAll,
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof],
+        );
+
+        assert_reject_reason(reason, RuntimeError::InvalidArgument {
+            argument: "owner_rule",
+            reason: "component(..)/template(..) cannot be used in a component owner rule".to_string(),
+        });
+    }
+
+    fn component_access_rules_with_scoped_method_rule(component: ComponentAddress) -> ComponentAccessRules {
+        use tari_bor::minicbor::{Encode, Encoder};
+
+        // Build the degenerate rule through the public enums and encode/decode it as a full
+        // `ComponentAccessRules`, bypassing the builder lint the way a hand-written or non-Rust template
+        // would.
+        let scoped_rule = AccessRule::Restricted(RestrictedAccessRule::Require(RequireRule::Require(
+            RuleRequirement::ScopedToComponent(component),
+        )));
+
+        let mut e = Encoder::new(Vec::new());
+        // ComponentAccessRules = [ method_access, default ] (positional struct array)
+        e.array(2).unwrap();
+        // method_access = { "set_value": scoped_rule }
+        e.map(1).unwrap();
+        e.str("set_value").unwrap();
+        Encode::encode(&scoped_rule, &mut e, &mut ()).unwrap();
+        // default = DenyAll
+        Encode::encode(&AccessRule::DenyAll, &mut e, &mut ()).unwrap();
+
+        let bytes = e.into_writer();
+        tari_bor::decode(&bytes).unwrap()
     }
 }
 
@@ -453,7 +565,10 @@ mod resource_access_rules {
                     10
                 ])
                 .put_last_instruction_output_on_workspace("tokens")
-                .call_method(user_account, "deposit", args![Workspace("tokens")])
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("proof")
+                ])
                 .drop_all_proofs_in_workspace()
                 .build_and_seal(&user_key),
             vec![user_proof.clone()],
@@ -557,10 +672,125 @@ mod resource_access_rules {
                     10
                 ])
                 .put_last_instruction_output_on_workspace("tokens")
-                .call_method(user_account, "deposit", args![Workspace("tokens")])
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("proof")
+                ])
                 .drop_all_proofs_in_workspace()
                 .build_and_seal(&user_key),
             vec![user_proof.clone()],
+        );
+    }
+
+    /// A resource's withdraw and deposit rules are evaluated in the account's own frame, and a `Proof` argument
+    /// is how a badge reaches a frame. The account holds the transaction's signer badge and nothing else of its
+    /// own, so a rule naming some other badge is satisfied only by handing that badge in.
+    #[test]
+    fn the_account_takes_a_badge_restricted_resource_when_handed_the_badge() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (owner_proof, _, owner_key) = test.create_owner_proof();
+        let (user_account, user_proof, user_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "using_resource_rules", args![])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let access_rules_component = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+        let resources = result
+            .finalize
+            .result
+            .any_accept()
+            .unwrap()
+            .up_iter()
+            .filter_map(|(addr, s)| s.substate_value().as_resource().map(|r| (addr, r)))
+            .map(|(addr, r)| (r.resource_type().is_non_fungible(), addr.as_resource_address().unwrap()))
+            .collect::<Vec<_>>();
+        let badge_resource = resources.iter().find(|(is_nft, _)| *is_nft).unwrap().1;
+        let token_resource = resources.iter().find(|(is_nft, _)| !*is_nft).unwrap().1;
+
+        // Give the user a badge and, with it, some of the restricted tokens. Both the resource's withdraw and
+        // deposit rules name the badge.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(access_rules_component, "mint_new_badge", args![])
+                .put_last_instruction_output_on_workspace("permission")
+                .call_method(user_account, "deposit", args![Workspace("permission")])
+                .build_and_seal(&owner_key),
+            vec![owner_proof],
+        );
+
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(user_account, "create_proof_by_amount", args![badge_resource, 1])
+                .put_last_instruction_output_on_workspace("proof")
+                .call_method(access_rules_component, "take_tokens_using_proof", args![
+                    Workspace("proof"),
+                    100
+                ])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("proof")
+                ])
+                .drop_all_proofs_in_workspace()
+                .build_and_seal(&user_key),
+            vec![user_proof.clone()],
+        );
+
+        // The account frame carries the signer badge, which the resource's withdraw rule does not name.
+        let reason = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(user_account, "withdraw", args![token_resource, 10])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit", args![Workspace("tokens")])
+                .build_and_seal(&user_key),
+            vec![user_proof.clone()],
+        );
+
+        assert_access_denied_for_action(reason, ResourceAuthAction::Withdraw);
+
+        // Handing the badge to the account's frame satisfies it.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(user_account, "create_proof_by_amount", args![badge_resource, 1])
+                .put_last_instruction_output_on_workspace("badge")
+                .call_method(user_account, "withdraw_with_auth", args![
+                    token_resource,
+                    10,
+                    Workspace("badge")
+                ])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("badge")
+                ])
+                .drop_all_proofs_in_workspace()
+                .build_and_seal(&user_key),
+            vec![user_proof.clone()],
+        );
+
+        // A proof over the restricted vault is checked against the same rule.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(user_account, "create_proof_by_amount", args![badge_resource, 1])
+                .put_last_instruction_output_on_workspace("badge")
+                .call_method(user_account, "create_proof_by_amount_with_auth", args![
+                    token_resource,
+                    10,
+                    Workspace("badge")
+                ])
+                .put_last_instruction_output_on_workspace("token_proof")
+                .drop_all_proofs_in_workspace()
+                .build_and_seal(&user_key),
+            vec![user_proof],
         );
     }
 
@@ -715,6 +945,151 @@ mod resource_access_rules {
         );
     }
 
+    /// A proof the submitter left on the workspace authorizes the call boundary and nothing past it: a frame acts
+    /// with the badges it is stamped with and the proofs it is handed as arguments. A method that takes no `Proof`
+    /// therefore cannot reach a resource action the badge guards, however the transaction was assembled.
+    #[test]
+    fn a_workspace_proof_reaches_a_callee_only_as_an_argument() {
+        let mut test = TemplateTest::new(CRATE_PATH, [
+            "tests/templates/access_rules",
+            "tests/templates/cross_template",
+        ]);
+
+        // The component and its resources belong to the owner: the user acts on them with a badge alone, so the
+        // resource's owner rule cannot stand in for the badge the test is about.
+        let (owner_proof, _, owner_key) = test.create_owner_proof();
+        let (user_account, user_proof, user_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+        let cross_call_template = test.get_template_address("CrossTemplate");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "using_resource_rules", args![])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+        let badge_resource = result
+            .finalize
+            .result
+            .any_accept()
+            .unwrap()
+            .up_iter()
+            .filter_map(|(addr, s)| s.substate_value().as_resource().map(|r| (addr, r)))
+            .filter(|(_, r)| r.resource_type().is_non_fungible())
+            .map(|(addr, _)| addr.as_resource_address().unwrap())
+            .next()
+            .unwrap();
+
+        // Give the user the badge that the token resource's withdraw and deposit rules name.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "mint_new_badge", args![])
+                .put_last_instruction_output_on_workspace("badge")
+                .call_method(user_account, "deposit", args![Workspace("badge")])
+                .build_and_seal(&owner_key),
+            vec![owner_proof],
+        );
+
+        // `take_tokens` takes no proof, so the component's frame is left with its own badges alone.
+        let reason = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(user_account, "create_proof_for_resource", args![badge_resource])
+                .put_last_instruction_output_on_workspace("proof")
+                .call_method(component_address, "take_tokens", args![10])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("proof")
+                ])
+                .drop_all_proofs_in_workspace()
+                .build_and_seal(&user_key),
+            vec![user_proof.clone()],
+        );
+
+        assert_access_denied_for_action(reason, ResourceAuthAction::Withdraw);
+
+        // The same badge, handed to the method, satisfies the rule.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(user_account, "create_proof_for_resource", args![badge_resource])
+                .put_last_instruction_output_on_workspace("proof")
+                .call_method(component_address, "take_tokens_using_proof", args![
+                    Workspace("proof"),
+                    10
+                ])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("proof")
+                ])
+                .drop_all_proofs_in_workspace()
+                .build_and_seal(&user_key),
+            vec![user_proof.clone()],
+        );
+
+        // A frame that was handed the proof may forward it onward.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(user_account, "create_proof_for_resource", args![badge_resource])
+                .put_last_instruction_output_on_workspace("proof")
+                .call_function(cross_call_template, "call_component_with_args_using_proof", args![
+                    component_address,
+                    "take_tokens_using_proof",
+                    Workspace("proof"),
+                    10,
+                ])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("proof")
+                ])
+                .drop_all_proofs_in_workspace()
+                .build_and_seal(&user_key),
+            vec![user_proof],
+        );
+    }
+
+    /// Signer badges are not proofs: they are stamped into every frame a top-level instruction pushes, so a rule
+    /// naming the signer is satisfied without any `Proof` argument.
+    #[test]
+    fn a_signer_gated_account_method_needs_no_proof_argument() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (owner_account, owner_proof, owner_key) = test.create_funded_account();
+        let (other_account, other_proof, other_key) = test.create_empty_account();
+
+        // The account's methods are gated on its owner rule, which the signer badge satisfies with no proof
+        // anywhere in the transaction.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(owner_account, "withdraw", args![TARI_TOKEN, 100])
+                .put_last_instruction_output_on_workspace("withdrawn")
+                .call_method(other_account, "deposit", args![Workspace("withdrawn")])
+                .build_and_seal(&owner_key),
+            vec![owner_proof],
+        );
+
+        // A different signer carries a different badge.
+        let reason = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(owner_account, "withdraw", args![TARI_TOKEN, 100])
+                .put_last_instruction_output_on_workspace("withdrawn")
+                .call_method(other_account, "deposit", args![Workspace("withdrawn")])
+                .build_and_seal(&other_key),
+            vec![other_proof],
+        );
+
+        assert_access_denied_for_action(reason, ActionIdent::ComponentCallMethod {
+            component_address: owner_account,
+            method: "withdraw".to_string(),
+        });
+    }
+
     #[allow(clippy::too_many_lines)]
     #[test]
     fn it_creates_a_proof_from_bucket() {
@@ -802,7 +1177,10 @@ mod resource_access_rules {
                     args![Workspace("proof"), 10],
                 )
                 .put_last_instruction_output_on_workspace("tokens")
-                .call_method(user_account, "deposit", args![Workspace("tokens")])
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("proof")
+                ])
                 // Deposit before dropping the proof - this step should error
                 .call_method(user_account, "deposit", args![Workspace("badges")])
                 .drop_all_proofs_in_workspace()
@@ -810,7 +1188,8 @@ mod resource_access_rules {
             vec![user_proof.clone()],
         );
 
-        assert_reject_reason(reason, RuntimeError::InvalidOpDepositLockedBucket {
+        assert_reject_reason(reason, RuntimeError::InvalidOpLockedBucket {
+            op: "deposit",
             // badges is the 1st bucket
             bucket_id: 0.into(),
             locked_amount: Amount::from(2u64),
@@ -844,7 +1223,10 @@ mod resource_access_rules {
                     args![Workspace("proof"), 10],
                 )
                 .put_last_instruction_output_on_workspace("tokens")
-                .call_method(user_account, "deposit", args![Workspace("tokens")])
+                .call_method(user_account, "deposit_with_auth", args![
+                    Workspace("tokens"),
+                    Workspace("proof")
+                ])
                 .drop_all_proofs_in_workspace()
                 .call_method(user_account, "deposit", args![Workspace("badges")])
                 .build_and_seal(&owner_key),
@@ -911,6 +1293,75 @@ mod resource_access_rules {
         );
     }
 
+    // The auth-hook path transfers the acting component's identity to the hook method's caller. The
+    // hook component is created by `AccessRulesTest::with_auth_hook_gated_on_caller`, whose
+    // `caller_gated_hook` method is gated on `caller_component(hook_caller)`. A built-in account acting
+    // on the resource (via `deposit`) is the caller the hook observes, even though the account's code
+    // never invoked the hook.
+    //
+    // Because any resource may bind the hook, the caller gate is satisfied whenever the gated account
+    // acts on *any* such resource. The hook body must therefore check `AuthHookCaller::resource`
+    // against the resources it manages; `caller_gated_hook` does, and that check is mandatory, not
+    // optional.
+    #[test]
+    fn it_transfers_caller_identity_through_auth_hook() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (actor_account, actor_proof, actor_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        // `take_tokens` withdraws into the workspace (the hook is skipped for the component's own
+        // resource), then `actor_account.deposit` triggers the hook. The deposit only succeeds if the
+        // hook observes `actor_account` as its caller.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_auth_hook_gated_on_caller", args![
+                    actor_account
+                ])
+                .put_last_instruction_output_on_workspace("hook")
+                .call_method("hook", "take_tokens", args![10])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(actor_account, "deposit", args![Workspace("tokens")])
+                .build_and_seal(&actor_key),
+            vec![actor_proof],
+        );
+    }
+
+    #[test]
+    fn it_denies_auth_hook_when_acting_caller_is_not_gated() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (gated_account, gated_proof, gated_key) = test.create_empty_account();
+        let (other_account, other_proof, other_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_auth_hook_gated_on_caller", args![
+                    gated_account
+                ])
+                .build_and_seal(&gated_key),
+            vec![gated_proof],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        let result = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "take_tokens", args![10])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(other_account, "deposit", args![Workspace("tokens")])
+                .build_and_seal(&other_key),
+            vec![other_proof],
+        );
+
+        assert_reject_reason(result, "Resource Auth Hook Denied Access");
+    }
+
     #[test]
     fn it_allows_resource_actions_if_auth_hook_passes() {
         let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
@@ -971,7 +1422,7 @@ mod resource_access_rules {
 
         assert_reject_reason(result, RuntimeError::AccessDeniedAuthHook {
             action_ident: ResourceAuthAction::Deposit.into(),
-            details: "Panic! Access denied for action Deposit".to_string(),
+            details: "Template error: Access denied for action Deposit".to_string(),
         });
     }
 
@@ -1045,11 +1496,123 @@ mod resource_access_rules {
             vec![user_proof.clone()],
         );
 
-        assert_reject_reason(
-            result,
-            RuntimeError::LockError(LockError::MultipleWriteLockRequested {
-                address: user_account.into(),
-            }),
+        assert_reject_reason(result, RuntimeError::ForbiddenInAuthHookContext {
+            operation: "call_invoke",
+        });
+    }
+
+    #[test]
+    fn it_allows_hook_to_update_its_own_state() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (_owner_account, owner_proof, owner_key) = test.create_empty_account();
+        let (user_account, user_proof, user_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_auth_hook", args![
+                    true,
+                    "counting_auth_hook"
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "take_tokens", args![10])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit", args![Workspace("tokens")])
+                .call_method(component_address, "get_value", args![])
+                .build_and_seal(&user_key),
+            vec![user_proof.clone()],
+        );
+
+        let value = result.finalize.execution_results[3].decode::<u32>().unwrap();
+        assert_eq!(value, 1, "the hook fired once for the deposit");
+    }
+
+    #[test]
+    fn it_disallows_hook_that_writes_outside_its_own_component() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (_owner_account, owner_proof, owner_key) = test.create_empty_account();
+        let (user_account, user_proof, user_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_auth_hook", args![
+                    true,
+                    "hook_creates_vault"
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        let result = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "take_tokens", args![10])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit", args![Workspace("tokens")])
+                .build_and_seal(&user_key),
+            vec![user_proof.clone()],
+        );
+
+        assert_reject_reason(result, "attempted in a resource auth hook");
+    }
+
+    /// Mint takes the resource's write lock. The hook guards that resource and may legitimately read it, so the
+    /// lock must not be held across the hook call.
+    #[test]
+    fn it_allows_a_hook_to_read_the_resource_it_guards() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (_owner_account, owner_proof, owner_key) = test.create_empty_account();
+        let (user_account, user_proof, user_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_mintable_auth_hook", args![
+                    "hook_reads_own_resource"
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let token_resource = result
+            .finalize
+            .result
+            .any_accept()
+            .unwrap()
+            .up_iter()
+            .filter_map(|(addr, s)| s.substate_value().as_resource().map(|r| (addr, r)))
+            .find(|(_, r)| !r.resource_type().is_non_fungible())
+            .map(|(addr, _)| addr.as_resource_address().unwrap())
+            .unwrap();
+
+        // `mint_resource` is a function rather than a method, so the mint acts on the resource from outside the
+        // hook's own component and the hook runs.
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "mint_resource", args![token_resource])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(user_account, "deposit", args![Workspace("tokens")])
+                .build_and_seal(&user_key),
+            vec![user_proof.clone()],
         );
     }
 
@@ -1099,11 +1662,14 @@ mod resource_access_rules {
             vec![user_proof.clone()],
         );
 
-        // Check that the access hook fails (it does not have permission to call set in the state component)
-        // even though the transaction signer has ownership of the object and the previous call to set works.
-        assert_reject_reason(result, RuntimeError::AccessDeniedAuthHook {
+        // Check that the access hook fails: a hook frame may not call out to any other component, even though the
+        // transaction signer has ownership of the object and the previous call to set works.
+        assert_reject_reason(&result, RuntimeError::AccessDeniedAuthHook {
             action_ident: ResourceAuthAction::Deposit.into(),
             details: String::new(),
+        });
+        assert_reject_reason(&result, RuntimeError::ForbiddenInAuthHookContext {
+            operation: "call_invoke",
         });
     }
 
@@ -1114,7 +1680,6 @@ mod resource_access_rules {
         let access_rules_template = test.get_template_address("AccessRulesTest");
 
         [
-            "invalid_auth_hook1",
             "invalid_auth_hook2",
             "invalid_auth_hook3",
             "invalid_auth_hook4",
@@ -1136,6 +1701,225 @@ mod resource_access_rules {
                 reason: "Authorize hook".to_string(),
             });
         })
+    }
+
+    #[test]
+    fn auth_hook_is_locked_by_default() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (_, owner_proof, owner_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_auth_hook", args![true, "valid_auth_hook"])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        let reason = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "set_auth_hook", args![None::<String>])
+                .build_and_seal(&owner_key),
+            vec![owner_proof],
+        );
+
+        assert_reject_reason(reason, RuntimeError::AccessDenied {
+            action_ident: ActionIdent::Native(NativeAction::UpdateResourceAuthHook),
+        });
+    }
+
+    #[test]
+    fn a_denying_auth_hook_can_be_removed_by_the_owner() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (owner_account, owner_proof, owner_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        // `allowed = false` makes `valid_auth_hook` panic on every action, which is the failure this action
+        // exists to recover from.
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_updatable_auth_hook", args![
+                    false,
+                    "valid_auth_hook",
+                    OWNER
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        let take_and_deposit = || {
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "take_tokens", args![10])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(owner_account, "deposit", args![Workspace("tokens")])
+                .build_and_seal(&owner_key)
+        };
+
+        let reason = test.execute_expect_failure(take_and_deposit(), vec![owner_proof.clone()]);
+        assert_reject_reason(reason, RuntimeError::AccessDeniedAuthHook {
+            action_ident: ResourceAuthAction::Deposit.into(),
+            details: "Template error: Access denied for action Deposit".to_string(),
+        });
+
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "set_auth_hook", args![None::<String>])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        test.execute_expect_success(take_and_deposit(), vec![owner_proof]);
+    }
+
+    #[test]
+    fn a_replacement_auth_hook_is_in_force() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (owner_account, owner_proof, owner_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        // `caller_gated_hook` permits every action, so the resource starts usable. `allowed = false` only
+        // takes effect once `valid_auth_hook` is the hook in force, which is what the swap below installs —
+        // so the denial afterwards can only come from the replacement, not from the hook having been dropped.
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_updatable_auth_hook", args![
+                    false,
+                    "caller_gated_hook",
+                    OWNER
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        let take_and_deposit = || {
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "take_tokens", args![10])
+                .put_last_instruction_output_on_workspace("tokens")
+                .call_method(owner_account, "deposit", args![Workspace("tokens")])
+                .build_and_seal(&owner_key)
+        };
+
+        test.execute_expect_success(take_and_deposit(), vec![owner_proof.clone()]);
+
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "set_auth_hook", args![Some("valid_auth_hook")])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let reason = test.execute_expect_failure(take_and_deposit(), vec![owner_proof]);
+        assert_reject_reason(reason, RuntimeError::AccessDeniedAuthHook {
+            action_ident: ResourceAuthAction::Deposit.into(),
+            details: "Template error: Access denied for action Deposit".to_string(),
+        });
+    }
+
+    #[test]
+    fn a_replacement_auth_hook_must_have_a_hook_signature() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (_, owner_proof, owner_key) = test.create_empty_account();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_updatable_auth_hook", args![
+                    true,
+                    "valid_auth_hook",
+                    OWNER
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        for hook in [
+            "invalid_auth_hook2",
+            "invalid_auth_hook3",
+            "invalid_auth_hook4",
+            "invalid_auth_hook5",
+            "hook_doesnt_exist",
+        ] {
+            let reason = test.execute_expect_failure(
+                Transaction::builder_localnet(Epoch(1))
+                    .call_method(component_address, "set_auth_hook", args![Some(hook)])
+                    .build_and_seal(&owner_key),
+                vec![owner_proof.clone()],
+            );
+
+            assert_reject_reason(reason, RuntimeError::InvalidArgument {
+                argument: "UpdateAuthHookArg",
+                // Partial error text
+                reason: "Authorize hook".to_string(),
+            });
+        }
+    }
+
+    #[test]
+    fn badge_holder_can_update_an_auth_hook_gated_on_their_badge() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (_, owner_proof, owner_key) = test.create_empty_account();
+        let (user_proof, _, user_key) = test.create_owner_proof();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let updater: UpdateRule = rule!(non_fungible(user_proof.clone())).into();
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_updatable_auth_hook", args![
+                    true,
+                    "valid_auth_hook",
+                    updater
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        // The resource owner does not hold the badge, so they cannot touch the hook.
+        let reason = test.execute_expect_failure(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "set_auth_hook", args![None::<String>])
+                .build_and_seal(&owner_key),
+            vec![owner_proof],
+        );
+        assert_reject_reason(reason, RuntimeError::AccessDenied {
+            action_ident: ActionIdent::Native(NativeAction::UpdateResourceAuthHook),
+        });
+
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "set_auth_hook", args![None::<String>])
+                .build_and_seal(&user_key),
+            vec![user_proof],
+        );
     }
 
     #[test]
@@ -1259,6 +2043,43 @@ mod resource_access_rules {
                 .call_method(owner_account, "deposit", args![Workspace("tokens")])
                 .build_and_seal(&user_key),
             vec![user_proof],
+        );
+    }
+
+    /// A caller requirement is an ordinary badge requirement, so a resource rule may be updated to one: the
+    /// resource's minter becomes "whoever is executing on behalf of this component".
+    #[test]
+    fn update_access_rule_accepts_caller_requirement() {
+        let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/access_rules"]);
+
+        let (owner_proof, _, owner_key) = test.create_owner_proof();
+
+        let access_rules_template = test.get_template_address("AccessRulesTest");
+
+        let result = test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_function(access_rules_template, "with_configured_rules", args![
+                    OwnerRule::OwnedBySigner,
+                    ComponentAccessRules::new().default(AccessRule::AllowAll),
+                    ResourceAccessRules::new().mintable(AccessRule::DenyAll, OWNER),
+                    AccessRule::DenyAll,
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof.clone()],
+        );
+
+        let component_address = result.finalize.execution_results[0]
+            .decode::<ComponentAddress>()
+            .unwrap();
+
+        test.execute_expect_success(
+            Transaction::builder_localnet(Epoch(1))
+                .call_method(component_address, "update_tokens_access_rule", args![
+                    ResourceAuthAction::Mint,
+                    rule!(caller_component(component_address))
+                ])
+                .build_and_seal(&owner_key),
+            vec![owner_proof],
         );
     }
 

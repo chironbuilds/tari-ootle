@@ -32,7 +32,7 @@ use ootle_byte_type::{ConvertFromByteType, ToByteType};
 use serde_json::{self as json, json};
 use tari_base_node_client::types::BaseLayerValidatorNode;
 use tari_common_types::types::CompressedPublicKey;
-use tari_consensus::hotstuff::ConsensusCurrentState;
+use tari_consensus::{consensus_constants::ConsensusConstants, hotstuff::ConsensusCurrentState};
 use tari_consensus_types::{Decision, LeafBlock};
 use tari_crypto::{ristretto::RistrettoPublicKey, tari_utilities::ByteArray};
 use tari_epoch_manager::{EpochManagerReader, service::EpochManagerHandle, traits::LayerOneTransactionSubmitter};
@@ -129,6 +129,7 @@ pub struct JsonRpcHandlers {
     layer_one_transaction_submitter: FileLayerOneSubmitter,
     global_db: GlobalDb<SqliteGlobalDbAdapter<PeerAddress>>,
     consensus: ConsensusHandle,
+    consensus_constants: ConsensusConstants,
     networking: NetworkingHandle<TariMessagingSpec>,
     state_store: ValidatorNodeStateStore,
 }
@@ -142,6 +143,7 @@ impl JsonRpcHandlers {
             template_provider: services.template_provider.clone(),
             epoch_manager: services.epoch_manager.clone(),
             consensus: services.consensus_handle.clone(),
+            consensus_constants: services.consensus_constants.clone(),
             global_db: services.global_db.clone(),
             layer_one_transaction_submitter: services.layer_one_transaction_submitter.clone(),
             networking: services.networking.clone(),
@@ -390,14 +392,15 @@ impl JsonRpcHandlers {
     pub async fn get_block(&self, value: JsonRpcExtractor) -> JrpcResult {
         let answer_id = value.get_answer_id();
         let data: GetBlockRequest = value.parse_params()?;
-        let (block, executions) = self
+        let (block, executions, total_block_execution_weight) = self
             .state_store
             .with_read_tx(|tx| {
                 let Some(block) = Block::get(tx, &data.block_id).optional()? else {
                     return Ok(None);
                 };
                 let executions = tx.block_transaction_executions_get_all_for_block(&data.block_id)?;
-                Ok::<_, StorageError>(Some((block, executions)))
+                let total_block_execution_weight = sum_block_execution_weight(tx, &block)?;
+                Ok::<_, StorageError>(Some((block, executions, total_block_execution_weight)))
             })
             .map_err(internal_error(answer_id.clone()))?
             .ok_or_else(|| not_found(answer_id.clone(), format!("Block {} not found", data.block_id)))?;
@@ -406,10 +409,18 @@ impl JsonRpcHandlers {
             .iter()
             .map(|e| e.result().wasm_execution_points)
             .fold(0u64, u64::saturating_add);
+        let total_native_execution_points = executions
+            .iter()
+            .map(|e| e.result().native_execution_points)
+            .fold(0u64, u64::saturating_add);
 
         let res = GetBlockResponse {
             block,
             total_wasm_execution_points,
+            total_native_execution_points,
+            max_block_execution_points: self.consensus_constants.max_block_execution_points,
+            total_block_execution_weight,
+            max_block_validation_weight: self.consensus_constants.max_block_validation_weight,
         };
         Ok(JsonRpcResponse::success(answer_id, res))
     }
@@ -898,4 +909,29 @@ impl JsonRpcHandlers {
             types::PrepareLayerOneTransactionResponse { path },
         ))
     }
+}
+
+/// Sums the execution weight of the block's transaction commands, expression for expression as a replica does when
+/// deciding whether to vote for the block: a transaction's weight, discounted by how much of the work its command
+/// stage actually adds. The result belongs with `max_block_validation_weight` and no other budget — a leader packs
+/// against a lower one under a different rule, spending it on foreign proposals too.
+///
+/// Two consequences of following the validation rule: a command carrying no execution weight (a foreign proposal)
+/// contributes nothing, and the discount floors where the proposer's rounds up, so a light transaction at a
+/// discounted stage can contribute 0 where the leader charged 1.
+///
+/// Transactions pruned from storage contribute nothing, so an old block's total may read low.
+fn sum_block_execution_weight<TTx: StateStoreReadTransaction>(tx: &TTx, block: &Block) -> Result<u64, StorageError> {
+    let mut total = 0u64;
+    for cmd in block.commands() {
+        let Some(atom) = cmd.transaction() else {
+            continue;
+        };
+        let Some(record) = atom.get_transaction(tx).optional()? else {
+            continue;
+        };
+        let weight = record.transaction().calculate_transaction_weight().as_u64();
+        total = total.saturating_add(weight.saturating_mul(cmd.execution_weight_percent()) / 100);
+    }
+    Ok(total)
 }

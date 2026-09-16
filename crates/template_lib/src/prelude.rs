@@ -30,8 +30,11 @@ pub use tari_template_lib_types::constants::XTR;
 pub use tari_template_lib_types::fast_hash::{FastMap, PrehashedMap, indexmap_codec};
 pub use tari_template_lib_types::{
     AccessRule,
+    AuthHook,
     AuthHookCaller,
     ComponentAddress,
+    Hash32,
+    Hash64,
     MaxBytes,
     MaxString,
     Metadata,
@@ -55,7 +58,13 @@ pub use tari_template_lib_types::{
     },
     bytes::Bytes,
     confidential::{ConfidentialOutputStatement, ConfidentialWithdrawProof},
-    constants::{PUBLIC_IDENTITY_RESOURCE_ADDRESS, STEALTH_TARI_RESOURCE_ADDRESS, TARI_TOKEN},
+    constants::{
+        CALLER_COMPONENT_RESOURCE_ADDRESS,
+        DIRECT_CALLER_TEMPLATE_RESOURCE_ADDRESS,
+        PUBLIC_IDENTITY_RESOURCE_ADDRESS,
+        STEALTH_TARI_RESOURCE_ADDRESS,
+        TARI_TOKEN,
+    },
     crypto::{
         BalanceProofSignature,
         PedersenCommitmentBytes,
@@ -89,6 +98,9 @@ pub use tari_template_macros::template;
 #[cfg(all(feature = "macro", not(target_arch = "wasm32")))]
 pub use tari_template_macros::template_non_wasm as template;
 
+/// Native primitives — Ristretto arithmetic, hashing, signature verification. Exposed as a module
+/// rather than glob-imported: these are specialist and read better qualified as `intrinsics::…`.
+pub use crate::intrinsics;
 pub use crate::{
     args::{VaultFreezeFlag, VaultFreezeFlags},
     caller_context::CallerContext,

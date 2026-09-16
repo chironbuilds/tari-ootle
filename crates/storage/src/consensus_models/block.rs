@@ -32,6 +32,7 @@ use tari_ootle_common_types::{
     ExtraFieldKey,
     NodeHeight,
     NumPreshards,
+    ProtocolVersion,
     ShardGroup,
     VersionedSubstateId,
     VersionedSubstateIdRef,
@@ -52,7 +53,6 @@ use super::{
     BlockDiff,
     BlockPledge,
     BookkeepingModel,
-    EvictNodeAtom,
     ForeignProposalAtom,
     ForeignProposalRecord,
     LockedEpoch,
@@ -129,6 +129,7 @@ impl Block {
     #[allow(clippy::too_many_arguments)]
     pub fn create(
         network: Network,
+        protocol_version: ProtocolVersion,
         parent: BlockId,
         justify: ProposalCertificate,
         high_tc: Option<TimeoutCertificate>,
@@ -147,6 +148,7 @@ impl Block {
     ) -> Result<Self, BlockError> {
         let header = BlockHeader::create(
             network,
+            protocol_version,
             parent,
             justify.calculate_id(),
             height,
@@ -185,6 +187,7 @@ impl Block {
 
     pub fn genesis(
         network: Network,
+        protocol_version: ProtocolVersion,
         epoch: Epoch,
         epoch_hash: FixedHash,
         shard_group: ShardGroup,
@@ -204,6 +207,7 @@ impl Block {
         let justify = ProposalCertificate::genesis(epoch, shard_group);
         let header = BlockHeader::genesis(
             network,
+            protocol_version,
             justify.calculate_id(),
             epoch,
             shard_group,
@@ -277,10 +281,6 @@ impl Block {
 
     pub fn all_foreign_proposals(&self) -> impl Iterator<Item = &ForeignProposalAtom> + '_ {
         self.commands.iter().filter_map(|c| c.foreign_proposal())
-    }
-
-    pub fn all_node_evictions(&self) -> impl Iterator<Item = &EvictNodeAtom> + '_ {
-        self.commands.iter().filter_map(|c| c.evict_node())
     }
 
     pub fn all_local_accept(&self) -> impl Iterator<Item = &TransactionAtom> + '_ {
@@ -418,10 +418,17 @@ impl Block {
         self.timeout_certificate.as_ref()
     }
 
+    /// Whether some branch has justified this block.
+    ///
+    /// This is stamped by a block carrying a QC over this one, before that block is voted on, and stays
+    /// stamped across the whole block store even where that branch is later abandoned. Work whose result
+    /// belongs to one branch must therefore key off that branch rather than off this flag.
     pub fn has_justify_qc(&self) -> bool {
         self.justify_qc_id.is_some()
     }
 
+    /// The id of a QC over this block, as last recorded by [`Self::add_justify_qc`]. Carries the same
+    /// whole-store scope as [`Self::has_justify_qc`].
     pub fn justify_qc_id(&self) -> Option<PcId> {
         self.justify_qc_id
     }

@@ -26,7 +26,7 @@ fn create_accounts_and_call_a_component() {
     let template = test.get_template_address("GuessingGame");
 
     // Creates a fresh key pair, publishes an account component for it and funds it from the
-    // built-in XTR faucet.
+    // built-in XtrFaucet, which dispenses TARI.
     let (player, _player_proof, player_key) = test.create_funded_account();
 
     let vaults = test.read_only_state_store().get_vaults_for_account(player).unwrap();
@@ -139,7 +139,7 @@ fn assert_on_a_rejected_transaction() {
             .build_and_seal(&cheat_key),
         vec![],
     );
-    assert_reject_reason(reason, "Panic! Guess must be from 0 to 10");
+    assert_reject_reason(reason, "Template error: Guess must be from 0 to 10");
 
     // A rejected transaction commits nothing: the same state the accepted guess produced.
     let after_rejection = test.read_only_state_store().get_component(game).unwrap();

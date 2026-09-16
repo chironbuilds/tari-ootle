@@ -43,7 +43,7 @@ same.
 ## Basic setup and creating accounts
 
 `create_funded_account` generates a fresh key pair, publishes an account component for it and funds
-it from the built-in XTR faucet, all in one call. It returns the account address, an ownership proof
+it from the built-in `XtrFaucet`, all in one call. It returns the account address, an ownership proof
 and the secret key you seal that account's transactions with:
 
 ```rust title="crates/engine/tests/testing_tutorial.rs"
@@ -51,7 +51,7 @@ let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/guessing_game"]);
 let template = test.get_template_address("GuessingGame");
 
 // Creates a fresh key pair, publishes an account component for it and funds it from the
-// built-in XTR faucet.
+// built-in XtrFaucet, which dispenses TARI.
 let (player, _player_proof, player_key) = test.create_funded_account();
 
 let vaults = test.read_only_state_store().get_vaults_for_account(player).unwrap();
@@ -276,7 +276,7 @@ let reason = test.execute_expect_failure(
         .build_and_seal(&cheat_key),
     vec![],
 );
-assert_reject_reason(reason, "Panic! Guess must be from 0 to 10");
+assert_reject_reason(reason, "Template error: Guess must be from 0 to 10");
 
 // A rejected transaction commits nothing: the same state the accepted guess produced.
 let after_rejection = test.read_only_state_store().get_component(game).unwrap();

@@ -13,6 +13,7 @@ use tari_ootle_common_types::{
     NodeAddressable,
     NodeHeight,
     NumPreshards,
+    ProtocolVersion,
     ShardGroup,
     committee::{Committee, CommitteeInfo},
     derive_fee_pool_address,
@@ -30,8 +31,8 @@ use tari_ootle_storage::{
         EpochCheckpoint,
         PendingShardStateTreeDiff,
         SubstateChange,
+        TransactionRecord,
         TreeRootSummary,
-        ValidatorConsensusStats,
     },
 };
 use tari_ootle_transaction::Network;
@@ -210,6 +211,7 @@ fn with_dummy_blocks<TAddr, TLeaderStrategy, F>(
         let (_, leader) = leader_strategy.get_leader(local_committee, view_height);
         let dummy_header = BlockHeader::dummy_block(
             network,
+            ProtocolVersion::at(network, epoch),
             parent_block_id,
             *leader,
             current_block_height,
@@ -343,47 +345,6 @@ pub(crate) fn filter_diff_for_committee(committee_info: &CommitteeInfo, diff: &S
     filtered_diff
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct NextLeader<'a, TAddr> {
-    pub address: &'a TAddr,
-    pub height: NodeHeight,
-    pub vote_to_skip_next: bool,
-}
-
-pub(crate) fn get_leader_for_view<
-    'a,
-    TTx: StateStoreReadTransaction,
-    TLeaderStrategy: LeaderStrategy<TAddr>,
-    TAddr: NodeAddressable,
->(
-    tx: &TTx,
-    committee: &'a Committee<TAddr>,
-    leader_strategy: &TLeaderStrategy,
-    block_id: &BlockId,
-    height: NodeHeight,
-) -> Result<NextLeader<'a, TAddr>, HotStuffError> {
-    let mut num_skipped = 0;
-
-    let (mut leader_addr, mut leader_pk) = leader_strategy.get_leader(committee, height);
-
-    let mut next_height = height;
-    while ValidatorConsensusStats::is_node_evicted(tx, block_id, leader_pk)? {
-        debug!(target: LOG_TARGET, "Validator {} evicted for {}. Checking next validator", leader_addr, next_height);
-        next_height += NodeHeight(1);
-        num_skipped += 1;
-        let (addr, pk) = leader_strategy.get_leader(committee, next_height);
-        leader_addr = addr;
-        leader_pk = pk;
-    }
-    debug!(target: LOG_TARGET, "Validator {} selected as leader at {}", leader_addr, next_height);
-
-    Ok(NextLeader {
-        height: next_height,
-        address: leader_addr,
-        vote_to_skip_next: num_skipped > 0,
-    })
-}
-
 pub fn apply_leader_fee_to_substate_store<TTx: StateStoreReadTransaction>(
     store: &mut PendingSubstateStore<TTx>,
     claim_public_key_bytes: &RistrettoPublicKeyBytes,
@@ -397,7 +358,8 @@ pub fn apply_leader_fee_to_substate_store<TTx: StateStoreReadTransaction>(
         return Ok(());
     }
 
-    let fee_substate_id = derive_fee_pool_address(claim_public_key_bytes, num_preshards, shard);
+    let fee_substate_id = derive_fee_pool_address(claim_public_key_bytes, num_preshards, shard)
+        .map_err(|err| HotStuffError::InvariantError(err.to_string()))?;
     store.update_in_place(
         &fee_substate_id.into(),
         |value_mut| {
@@ -438,6 +400,11 @@ pub(crate) fn get_highest_seen_justified_view<TTx: StateStoreReadTransaction>(
     Ok(high_pc.max(high_tc))
 }
 
+/// Records the prepare/accept evidence for the commands in `new_leaf_block` and its not-yet-justified ancestors,
+/// now that `justify_id` justifies them, and marks any transaction that this completes as ready to propose.
+///
+/// The updates are written to `change_set`, which only ever applies to the branch its block is on, so every branch
+/// that justifies `new_leaf_block` must call this for itself.
 #[allow(clippy::too_many_lines)]
 pub fn process_newly_justified_block<TTx: StateStoreReadTransaction>(
     tx: &TTx,
@@ -488,11 +455,25 @@ pub fn process_newly_justified_block<TTx: StateStoreReadTransaction>(
                 .get_transaction_pool_record(tx, new_leaf_block, atom.id())
                 .optional()?
             else {
-                return Err(HotStuffError::InvariantError(format!(
-                    "Transaction {} in newly justified block {} not found in the pool",
-                    atom.id(),
-                    new_leaf_block,
-                )));
+                // Finalizing a transaction removes its pool record, and a finalized transaction has no evidence
+                // left to update. Any other absence leaves the transaction unable to make progress.
+                if TransactionRecord::is_record_finalized(tx, atom.id())? {
+                    debug!(
+                        target: LOG_TARGET,
+                        "Transaction {} in justified block {} is finalized and no longer in the pool",
+                        atom.id(),
+                        block,
+                    );
+                } else {
+                    warn!(
+                        target: LOG_TARGET,
+                        "❓️ Transaction {} in justified block {} is not in the pool and is not finalized. Its \
+                         evidence cannot be updated.",
+                        atom.id(),
+                        block,
+                    );
+                }
+                continue;
             };
 
             if cmd.is_local_prepare() {
@@ -503,7 +484,7 @@ pub fn process_newly_justified_block<TTx: StateStoreReadTransaction>(
                 debug!(
                     target: LOG_TARGET,
                     "🔍 Updating evidence for LocalPrepare command in block {} for transaction {}. {}",
-                    new_leaf_block,
+                    block,
                     atom.id(),
                     pool_tx.evidence()
                 );
@@ -515,7 +496,7 @@ pub fn process_newly_justified_block<TTx: StateStoreReadTransaction>(
                 debug!(
                     target: LOG_TARGET,
                     "🔍 Updating evidence for LocalAccept command in block {} for transaction {}. {}",
-                    new_leaf_block,
+                    block,
                     atom.id(),
                     pool_tx.evidence()
                 );
@@ -529,7 +510,7 @@ pub fn process_newly_justified_block<TTx: StateStoreReadTransaction>(
                     target: LOG_TARGET,
                     "✅ Justified block: Setting READY for transaction {} in block {}",
                     atom.id(),
-                    new_leaf_block,
+                    block,
                 );
                 pool_tx.set_ready(true);
             }
@@ -539,11 +520,6 @@ pub fn process_newly_justified_block<TTx: StateStoreReadTransaction>(
 
         timer.with_iterations(num_applicable_commands);
         Ok(())
-    }
-
-    // Nothing to do if the block has been marked as justified
-    if new_leaf_block.justify_qc_id() == Some(justify_id) {
-        return Ok(vec![]);
     }
 
     // Update the pending transaction pool state for the chain of newly justified blocks.

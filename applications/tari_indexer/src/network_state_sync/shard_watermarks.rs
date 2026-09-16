@@ -52,12 +52,30 @@ impl ShardWatermarks {
         entry.confirmed_at = now;
     }
 
+    /// Re-stamps `shard`'s watermark as confirmed now, at the version it already holds. A shard that
+    /// was never confirmed stays unconfirmed: liveness alone says nothing about what it holds.
+    pub fn refresh(&self, shard: Shard) {
+        let now = Instant::now();
+        if let Some(entry) = self.write().get_mut(&shard) {
+            entry.confirmed_at = now;
+        }
+    }
+
     /// The watermark for `shard`, or `None` if it has never been confirmed in this run or was last
     /// confirmed longer than `max_lag` ago.
     pub fn get(&self, shard: Shard, max_lag: Duration) -> Option<StateVersion> {
         let inner = self.read();
         let watermark = inner.get(&shard)?;
         (watermark.confirmed_at.elapsed() <= max_lag).then_some(watermark.state_version)
+    }
+
+    /// The watermark for `shard` and how long ago it was confirmed, or `None` if it never was in
+    /// this run. Read together so that a confirmation landing between the two cannot make them
+    /// disagree.
+    pub fn confirmed(&self, shard: Shard) -> Option<(StateVersion, Duration)> {
+        self.read()
+            .get(&shard)
+            .map(|watermark| (watermark.state_version, watermark.confirmed_at.elapsed()))
     }
 
     // Poisoning is recovered from rather than propagated: the map holds no invariant a panic could
@@ -98,5 +116,30 @@ mod tests {
         let watermarks = ShardWatermarks::new();
         watermarks.confirm(SHARD, StateVersion::new(10));
         assert!(watermarks.get(SHARD, Duration::ZERO).is_none());
+    }
+
+    #[test]
+    fn a_refresh_keeps_a_shard_open_at_its_version() {
+        let watermarks = ShardWatermarks::new();
+        watermarks.confirm(SHARD, StateVersion::new(7));
+        watermarks.refresh(SHARD);
+        assert_eq!(watermarks.get(SHARD, MAX_LAG), Some(StateVersion::new(7)));
+    }
+
+    #[test]
+    fn a_confirmation_reports_its_version_and_age_together() {
+        let watermarks = ShardWatermarks::new();
+        assert!(watermarks.confirmed(SHARD).is_none());
+        watermarks.confirm(SHARD, StateVersion::new(7));
+        let (version, age) = watermarks.confirmed(SHARD).unwrap();
+        assert_eq!(version, StateVersion::new(7));
+        assert!(age < MAX_LAG);
+    }
+
+    #[test]
+    fn a_refresh_does_not_confirm_a_shard_that_never_was() {
+        let watermarks = ShardWatermarks::new();
+        watermarks.refresh(SHARD);
+        assert_eq!(watermarks.get(SHARD, MAX_LAG), None);
     }
 }

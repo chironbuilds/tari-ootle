@@ -62,8 +62,21 @@ Main indexer application settings.
 # Block scanning interval in seconds (default: 10)
 #block_scanning_interval = 10
 
-# State scanning interval in seconds (default: 60)
+# How long, in seconds, a shard group waits before reopening its state sync stream after it fails,
+# or after a validator that does not follow its tip closes it (default: 60)
 #state_scanning_interval = 60
+
+# The longest, in seconds, a validator holds a state sync stream open with no transition to send. The
+# stream follows the validator's tip and is reopened once this passes, one completion marker per
+# shard. Keepalives show the validator is still there while the stream is quiet, so this only sets
+# how often a quiet stream is reopened (default: 600)
+#state_sync_stream_deadline = 600
+
+# How often, in seconds, a validator is asked to show it is still there while the state sync stream
+# has nothing to send. Each keepalive re-confirms the shards the stream has caught up, which keeps the
+# substate cache serving quiet shards. Must be well under state_sync_stream_deadline; validators serve
+# no shorter than their own minimum (5s by default) (default: 10)
+#state_sync_keepalive_interval = 10
 
 # How many epochs past its terminal epoch a transaction submitted through this indexer is retained.
 # A transaction's terminal epoch is the epoch it committed in once its receipt has been indexed, and

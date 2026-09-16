@@ -32,7 +32,7 @@ tari_indexer_client = { workspace = true, default-features = false, features = [
 tari_indexer_lib = { workspace = true }
 tari_ootle_template_metadata = { workspace = true }
 tari_networking = { workspace = true }
-tari_ootle_app_utilities = { workspace = true, features = ["epoch_oracle", "p2p"] }
+tari_ootle_app_utilities = { workspace = true, features = ["consensus_constants", "epoch_oracle", "execution", "p2p"] }
 tari_ootle_common_types = { workspace = true }
 tari_ootle_p2p = { workspace = true }
 tari_ootle_storage = { workspace = true }
@@ -91,6 +91,7 @@ tokio = { workspace = true, features = [
     "rt-multi-thread",
 ] }
 tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
 tower-http = { workspace = true, features = ["default", "cors", "limit", "trace"] }
 url = { workspace = true, features = ["serde"] }
 prometheus-client = { workspace = true, optional = true }

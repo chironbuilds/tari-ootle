@@ -146,13 +146,20 @@ where TConsensusSpec: ConsensusSpec
         }
 
         // Take note of unique NEWVIEWs so that we can count them
-        let Some((timeout_certificate, high_tc)) = self
+        let (timeout_certificate, high_tc) = match self
             .timeout_vote_collector
             .check_and_collect_vote(from, current_height, epoch_state, timeout)
-            .await?
-        else {
-            debug!(target: LOG_TARGET, "🌟 Received NEWVIEW but quorum is not yet reached.");
-            return Ok(());
+            .await
+        {
+            Ok(Some(tc)) => tc,
+            Ok(None) => {
+                debug!(target: LOG_TARGET, "🌟 Received NEWVIEW but quorum is not yet reached.");
+                return Ok(());
+            },
+            Err(err) => {
+                warn!(target: LOG_TARGET, "❌ Error handling timeout vote: {}", err);
+                return Ok(());
+            },
         };
 
         let threshold = epoch_state.local_committee_info().quorum_threshold();
@@ -185,6 +192,7 @@ where TConsensusSpec: ConsensusSpec
             });
         }
         check_quorum_certificate_signatures::<TConsensusSpec>(
+            self.proposal_vote_collector.network(),
             qc.into(),
             epoch_state.local_committee(),
             vote_signing_service,

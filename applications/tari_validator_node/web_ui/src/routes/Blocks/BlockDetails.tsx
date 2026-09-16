@@ -23,13 +23,26 @@
 import { useState, useEffect } from "react";
 import { Link, useParams } from "react-router-dom";
 import { Accordion, AccordionDetails, AccordionSummary } from "../../Components/Accordion";
-import { Grid, Table, TableContainer, TableBody, TableRow, TableCell, Button, Fade, Alert } from "@mui/material";
+import {
+  Grid,
+  Table,
+  TableContainer,
+  TableBody,
+  TableRow,
+  TableCell,
+  Button,
+  Fade,
+  Alert,
+  Box,
+  Tooltip,
+} from "@mui/material";
 import Typography from "@mui/material/Typography";
 import { DataTableCell, StyledPaper } from "../../Components/StyledComponents";
 import PageHeading from "../../Components/PageHeading";
 import StatusChip from "../../Components/StatusChip";
 import KeyboardArrowDownIcon from "@mui/icons-material/KeyboardArrowDown";
 import KeyboardArrowUpIcon from "@mui/icons-material/KeyboardArrowUp";
+import HelpOutlineIcon from "@mui/icons-material/HelpOutline";
 import Loading from "../../Components/Loading";
 import { getBlock, getIdentity } from "../../utils/json_rpc";
 import Transactions from "./Transactions";
@@ -54,6 +67,60 @@ const COMMANDS = [
 
 type OtherCommands = Record<string, Array<any>>;
 
+function BudgetCell({ used, budget, tooltip }: { used: number; budget: number; tooltip: string }) {
+  if (!budget) {
+    return <>{used.toLocaleString()}</>;
+  }
+  const percent = (used / budget) * 100;
+  // Sub-0.01% blocks are the common case on a quiet network, so distinguish them from empty rather than rounding
+  // them to zero.
+  const share = !used ? "0" : percent < 0.01 ? "<0.01" : percent.toFixed(2);
+  return (
+    <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+      {used.toLocaleString()} ({share}%)
+      <Tooltip arrow title={tooltip}>
+        <HelpOutlineIcon sx={{ fontSize: "1rem", opacity: 0.6, cursor: "help" }} />
+      </Tooltip>
+    </Box>
+  );
+}
+
+// The per-block budget governs WASM and native points together, so only their sum may be shown as a share of it.
+function ExecutionPointsCell({ wasm, native, max }: { wasm: bigint; native: bigint; max: bigint }) {
+  return (
+    <BudgetCell
+      used={Number(wasm) + Number(native)}
+      budget={Number(max)}
+      tooltip="Compute metered for this block, against the per-block budget."
+    />
+  );
+}
+
+// The sum follows the validation rule, so it belongs with the validation bound and no other budget.
+function BlockWeightCell({ weight, max }: { weight: bigint; max: bigint }) {
+  return (
+    <BudgetCell
+      used={Number(weight)}
+      budget={Number(max)}
+      tooltip="Size and IO cost of this block's transactions, against the most a replica will vote for."
+    />
+  );
+}
+
+function BlockBurnCell({ burn, leaderFee }: { burn: bigint | null; leaderFee: bigint }) {
+  if (burn === null) {
+    return <span>…</span>;
+  }
+  const collected = leaderFee + burn;
+  const percent = collected > 0n ? Number((burn * 1000n) / collected) / 10 : null;
+  return (
+    <span>
+      {burn.toString()}
+      {percent !== null ? ` (${percent}% of ${collected.toString()} collected)` : ""}
+    </span>
+  );
+}
+
 export default function BlockDetails() {
   const { blockId } = useParams();
   const [expandedPanels, setExpandedPanels] = useState<string[]>([]);
@@ -68,7 +135,12 @@ export default function BlockDetails() {
   const [identity, setIdentity] = useState<VNGetIdentityResponse>();
   const [blockTime, setBlockTime] = useState<number>(0);
   const [wasmPoints, setWasmPoints] = useState<bigint>(0n);
+  const [nativePoints, setNativePoints] = useState<bigint>(0n);
+  const [maxExecutionPoints, setMaxExecutionPoints] = useState<bigint>(0n);
+  const [blockWeight, setBlockWeight] = useState<bigint>(0n);
+  const [maxBlockWeight, setMaxBlockWeight] = useState<bigint>(0n);
   const [foreignProposals, setForeignProposals] = useState<ForeignProposalAtom[]>([]);
+  const [blockExhaustBurn, setBlockExhaustBurn] = useState<bigint | null>(null);
 
   useEffect(() => {
     if (blockId !== undefined) {
@@ -77,12 +149,24 @@ export default function BlockDetails() {
           setIdentity(identity);
           setBlock(resp.block);
           setWasmPoints(resp.total_wasm_execution_points);
+          setNativePoints(resp.total_native_execution_points);
+          setMaxExecutionPoints(resp.max_block_execution_points);
+          setBlockWeight(resp.total_block_execution_weight);
+          setMaxBlockWeight(resp.max_block_validation_weight);
           getBlock({ block_id: resp.block.header.parent }).then((justify_block) => {
             if (resp.block.stored_at && justify_block.block.stored_at) {
               let blockTime = resp.block.block_time || 0;
               let justifyTime = justify_block.block.block_time || 0;
               setBlockTime(Math.floor(new Date(blockTime * 1000).getTime() / 1000) - Math.floor(new Date(justifyTime * 1000).getTime() / 1000));
             }
+            // The header burn accumulates within an epoch, so this block's burn is the step from
+            // the parent, or the whole figure when the parent belongs to the previous epoch.
+            const accumulated = BigInt(resp.block.header.accumulated_data.total_exhaust_burn);
+            const parentAccumulated =
+              justify_block.block.header.epoch === resp.block.header.epoch
+                ? BigInt(justify_block.block.header.accumulated_data.total_exhaust_burn)
+                : 0n;
+            setBlockExhaustBurn(accumulated > parentAccumulated ? accumulated - parentAccumulated : 0n);
           });
           setEpochEvents([]);
           const otherCommands: OtherCommands = {};
@@ -182,6 +266,10 @@ export default function BlockDetails() {
                             <DataTableCell>{block!.header.height}</DataTableCell>
                           </TableRow>
                           <TableRow>
+                            <TableCell>Protocol version</TableCell>
+                            <DataTableCell>V{block!.header.protocol_version}</DataTableCell>
+                          </TableRow>
+                          <TableRow>
                             <TableCell>Proposal Certificate</TableCell>
                             <DataTableCell>{block!.justify.height} ({block!.justify.signatures.length} signatures)</DataTableCell>
                           </TableRow>
@@ -200,6 +288,14 @@ export default function BlockDetails() {
                             </DataTableCell>
                           </TableRow>
                           <TableRow>
+                            <TableCell title="The share of the fees collected in this block that is burnt rather than paid to the leader">
+                              Fee Burn
+                            </TableCell>
+                            <DataTableCell>
+                              <BlockBurnCell burn={blockExhaustBurn} leaderFee={BigInt(block!.header.total_leader_fee)} />
+                            </DataTableCell>
+                          </TableRow>
+                          <TableRow>
                             <TableCell
                               title="The total fees burnt by this shard group for this epoch as part of the exhaust">Accumulated
                               Fee Burn</TableCell>
@@ -208,9 +304,16 @@ export default function BlockDetails() {
                             </DataTableCell>
                           </TableRow>
                           <TableRow>
-                            <TableCell title="Total WASM metering points consumed by transactions executed for this block">WASM
-                              Points</TableCell>
-                            <DataTableCell>{wasmPoints.toString()}</DataTableCell>
+                            <TableCell>Execution Weight</TableCell>
+                            <DataTableCell>
+                              <BlockWeightCell weight={blockWeight} max={maxBlockWeight} />
+                            </DataTableCell>
+                          </TableRow>
+                          <TableRow>
+                            <TableCell>Execution Points</TableCell>
+                            <DataTableCell>
+                              <ExecutionPointsCell wasm={wasmPoints} native={nativePoints} max={maxExecutionPoints} />
+                            </DataTableCell>
                           </TableRow>
                           <TableRow>
                             <TableCell>Status</TableCell>

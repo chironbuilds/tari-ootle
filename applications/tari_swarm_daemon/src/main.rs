@@ -22,6 +22,7 @@ use crate::{
 mod cli;
 mod config;
 mod layer_one_transactions;
+mod logfile;
 mod logger;
 mod process_definitions;
 mod process_manager;
@@ -217,6 +218,13 @@ async fn start(cli: &Cli) -> anyhow::Result<()> {
     create_paths(&config).await?;
 
     init_logger(config.log_to_file.then_some(config.base_dir.join("logs/")))?;
+
+    log::info!(
+        "🐝 Starting swarm on {} (base dir: {}, start port: {})",
+        config.network,
+        config.base_dir.display(),
+        config.start_port
+    );
 
     let mut shutdown = Shutdown::new();
     let signal = shutdown.to_signal().select(exit_signal().context("exit_signal")?);

@@ -10,6 +10,7 @@ use tari_ootle_common_types::{
     Epoch,
     NodeHeight,
     committee::{Committee, CommitteeInfo},
+    optional::Optional,
 };
 use tari_ootle_storage::{
     StateStore,
@@ -176,7 +177,7 @@ impl<TConsensusSpec: ConsensusSpec> OnMessageValidate<TConsensusSpec> {
 
     fn next_request_id(&mut self) -> u32 {
         let req_id = self.current_request_id;
-        self.current_request_id += 1;
+        self.current_request_id = self.current_request_id.wrapping_add(1);
         req_id
     }
 
@@ -461,10 +462,22 @@ impl<TConsensusSpec: ConsensusSpec> OnMessageValidate<TConsensusSpec> {
             });
         }
 
-        let committee = self
+        let Some(committee) = self
             .epoch_manager
             .get_committee_by_validator_public_key(msg.proposal.epoch(), msg.proposal.proposed_by())
-            .await?;
+            .await
+            .optional()?
+        else {
+            warn!(
+                target: LOG_TARGET,
+                "❌ Foreign proposal block {} was proposed by {} who is not a registered validator for epoch {}. \
+                 Discarding message.",
+                msg.proposal,
+                msg.proposal.proposed_by(),
+                msg.proposal.epoch(),
+            );
+            return Ok(MessageValidationResult::Discard);
+        };
 
         if let Err(err) = self.check_foreign_proposal(&msg.proposal, &committee) {
             // Save the proposal as invalid in the store (TODO: just for debugging purposes, perhaps provide a

@@ -19,7 +19,7 @@ use tokio_stream::StreamExt;
 
 use crate::{
     network_state_sync::EventFilter,
-    rest_api::{context::HandlerContext, handlers::HandlerResult},
+    rest_api::{context::HandlerContext, handlers::HandlerResult, streaming::disable_proxy_buffering},
     storage_sqlite::SqliteIndexerStore,
     store::ReadOnlyStore,
 };
@@ -40,9 +40,9 @@ const REPLAY_PAGE_SIZE: u32 = 500;
         ("topic" = Option<String>, Query, description = "Filter by event topic"),
         ("substate_id" = Option<String>, Query, description = "Filter by substate ID"),
         ("template_address" = Option<String>, Query, description = "Filter by template address"),
-        ("resource_address" = Option<String>, Query, description = "Filter by resource address \
-            (derived from substate_id for std.resource.* events, or from the `resource_address` \
-            payload entry for std.vault.deposit / std.vault.withdraw)"),
+        ("resource_address" = Option<String>, Query, description = "Filter by resource address. \
+            Matches only std.resource.* events, which carry the resource as their substate_id. \
+            Vault events name no resource: filter those by substate_id (the vault ID)"),
         ("after_id" = Option<i64>, Query, description = "Resume from this event ID (exclusive)"),
     )
 )]
@@ -92,6 +92,7 @@ pub async fn sse_transaction_events(
     response
         .headers_mut()
         .insert(header::VARY, HeaderValue::from_static("last-event-id"));
+    disable_proxy_buffering(response.headers_mut());
     Ok(response)
 }
 

@@ -46,7 +46,6 @@ use tari_template_test_tooling::{
     support::assert_error::assert_reject_reason,
 };
 use tari_transaction_manifest::ManifestValue;
-use wasmer::ExportError;
 
 const CRATE_PATH: &str = env!("CARGO_MANIFEST_DIR");
 #[test]
@@ -202,7 +201,8 @@ fn test_composed() {
 
 #[test]
 fn test_buggy_template() {
-    // Uncomment the following lines to print the ABI bytes
+    // Uncomment the following lines to print the template definition bytes embedded in the
+    // `tari_tdef` custom section
     // let bytes = tari_template_abi::TemplateDef::V1(tari_template_abi::TemplateDefV1 {
     //     template_name: "Buggy".to_string(),
     //     abi_version: tari_template_abi::version::MINIMUM_SUPPORTED_WASM_ABI_VERSION,
@@ -210,7 +210,7 @@ fn test_buggy_template() {
     // })
     // .encode_for_wasm_embedding()
     // .unwrap();
-    // println!("pub static _ABI_TEMPLATE_DEF: [u8; {}] = [", bytes.len());
+    // println!("static _TARI_TEMPLATE_DEF: [u8; {}] = [", bytes.len());
     // for chunk in bytes.chunks(16) {
     //     print!("    ");
     //     for byte in chunk {
@@ -219,18 +219,6 @@ fn test_buggy_template() {
     //     println!();
     // }
     // println!("];");
-
-    let err = compile_template("tests/templates/buggy", &["return_null_abi"])
-        .unwrap()
-        .load_template()
-        .unwrap_err();
-    match err {
-        // The ptr location is non-zero, and the pointer reads a large length that is out of range
-        TemplateLoaderError::WasmModuleError(WasmExecutionError::MemoryPointerOutOfRange { .. }) => {},
-        // The ptr location is zero, so the decode fails
-        TemplateLoaderError::WasmModuleError(WasmExecutionError::AbiTemplateDefDecodeError { .. }) => {},
-        _ => panic!("Unexpected error: {:?}", err),
-    }
 
     let err = compile_template("tests/templates/buggy", &["unexpected_export_function"])
         .unwrap()
@@ -241,15 +229,6 @@ fn test_buggy_template() {
         TemplateLoaderError::WasmModuleError(WasmExecutionError::UnexpectedAbiFunction { .. })
     ));
 
-    let err = compile_template("tests/templates/buggy", &["return_empty_abi"])
-        .unwrap()
-        .load_template()
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        TemplateLoaderError::WasmModuleError(WasmExecutionError::AbiTemplateDefDecodeError(_))
-    ));
-
     let err = compile_template("tests/templates/buggy", &["no_template_def"])
         .unwrap()
         .load_template()
@@ -257,7 +236,7 @@ fn test_buggy_template() {
 
     assert!(matches!(
         err,
-        TemplateLoaderError::WasmModuleError(WasmExecutionError::ExportError(ExportError::Missing(_)))
+        TemplateLoaderError::WasmModuleError(WasmExecutionError::AbiTemplateDefSectionMissing)
     ));
 }
 
@@ -353,8 +332,8 @@ fn test_engine_errors() {
         vec![],
     );
 
-    // Check that the engine error is captured in the execution result rather than the WASM panic message (Panic! Engine
-    // call returned null for op VaultInvoke)
+    // Check that the engine error is captured in the execution result rather than the WASM panic
+    // message (Template error: Engine call returned null for op VaultInvoke)
     assert_reject_reason(
         reason,
         RejectReason::SubstateNotFound(
@@ -412,6 +391,20 @@ fn test_get_template_address() {
     assert_eq!(addr, template_test.get_template_address("Account"));
 }
 
+/// A component's owner rule is immutable, so `GetOwnerProof` reads it without a lock — but it must read what the
+/// transaction has written, not what the store had, or a component created in this same transaction has no proof.
+#[test]
+fn test_get_owner_proof_for_a_component_created_in_the_same_transaction() {
+    let mut template_test = TemplateTest::new(CRATE_PATH, vec!["tests/templates/component_manager"]);
+
+    let _: ComponentAddress = template_test.call_function(
+        "ComponentManagerTest",
+        "owner_proof_for_a_component_created_here",
+        args![],
+        vec![],
+    );
+}
+
 #[test]
 fn test_random() {
     let mut template_test = TemplateTest::new(CRATE_PATH, vec!["tests/templates/random"]);
@@ -463,7 +456,9 @@ mod errors {
             .unwrap();
         match result.finalize.result.any_reject().unwrap() {
             RejectReason::ExecutionFailure(message) => {
-                assert!(message.contains("Panic! This error message should be included in the execution result"));
+                assert!(
+                    message.contains("Template error: This error message should be included in the execution result")
+                );
             },
             reason => panic!("Unexpected transaction reject reason: {}", reason),
         }
@@ -518,7 +513,7 @@ mod errors {
         );
         assert_reject_reason(
             reason,
-            "Panic! failed to decode tuple argument at position 1 (Tuple<String,U32>) for function 'set'",
+            "Template error: failed to decode tuple argument at position 1 (Tuple<String,U32>) for function 'set'",
         )
     }
 
@@ -537,7 +532,7 @@ mod errors {
         );
         assert_reject_reason(
             reason,
-            "Panic! failed to decode argument at position 0 (Amount) for function 'please_pass_invalid_args'",
+            "Template error: failed to decode argument at position 0 (Amount) for function 'please_pass_invalid_args'",
         )
     }
 }

@@ -74,7 +74,7 @@ use tari_ootle_app_utilities::{
     shared_consts::TXTR_FAUCET_INITIAL_SUPPLY,
 };
 use tari_ootle_common_types::optional::Optional;
-use tari_ootle_p2p::{PeerAddress, TRANSACTION_TOPIC, TariMessagingSpec};
+use tari_ootle_p2p::{PeerAddress, TRANSACTION_TOPIC, TariMessagingSpec, max_gossip_message_size};
 use tari_ootle_storage::global::GlobalDb;
 use tari_ootle_storage_sqlite::global::SqliteGlobalDbAdapter;
 use tari_ootle_transaction::Network;
@@ -88,7 +88,6 @@ use tokio::task;
 use crate::{
     ApplicationConfig,
     IndexerEpochManagerSpec,
-    Noop,
     base_layer::verify_correct_network,
     config::PublishedIndexerConfig,
     dry_run::processor::DryRunTransactionProcessor,
@@ -108,12 +107,25 @@ use crate::{
 
 const LOG_TARGET: &str = "tari::indexer::bootstrap";
 
-/// How long a substate stays journalled as recently changed. The journal exists only to stop a
-/// committee fetch that started before a transition arrived from writing its result back as current,
-/// so it needs to outlive an in-flight fetch and nothing more.
+/// How long a substate stays journalled as recently changed.
+///
+/// The journal stops a fetch from writing back a version the stream has moved past, which covers two
+/// things with different horizons. A fetch the transition overtook is bounded by how long a fetch
+/// takes. A fetch answered by a committee member that is behind is bounded by how far behind that
+/// member is, which is the longer of the two and the one this must outlive: a member lagging by less
+/// than this serves stale copies only of substates whose journal rows are still here to refuse them.
 const SUBSTATE_CACHE_JOURNAL_RETENTION: Duration = Duration::from_secs(300);
 
 const SUBSTATE_CACHE_PRUNE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Keepalives a shard's stream may miss before a record that a substate does not exist stops being
+/// served for it.
+///
+/// Derived from the keepalive interval rather than configured: the bound is not a staleness budget
+/// but a liveness test - a negative is only as true as the stream that would retract it - and a
+/// standalone setting could be left behind when that interval changes. Two may be lost before the
+/// cache closes, which is enough to ride out an ordinary reopen without holding a dead stream open.
+const NEGATIVE_SERVE_KEEPALIVES: u32 = 3;
 
 #[allow(clippy::too_many_lines)]
 pub async fn spawn_services(
@@ -188,6 +200,7 @@ pub async fn spawn_services(
                 // The indexer reports a `Reject` verdict for messages that fail to decode or fail
                 // validation, so it can score the peers that send them.
                 gossip_sub_scored_topics: vec![TRANSACTION_TOPIC.to_string()],
+                gossip_sub_max_message_size: max_gossip_message_size(consensus_constants.max_transaction_size_bytes),
                 relay_circuit_limits: RelayCircuitLimits::high(),
                 relay_reservation_limits: RelayReservationLimits::high(),
                 rendezvous_server_enabled: config.indexer.p2p.enable_rendezvous,
@@ -240,7 +253,6 @@ pub async fn spawn_services(
         global_db.clone(),
         keypair.public_key().to_byte_type(),
         epoch_event_oracle,
-        Noop,
         shutdown.clone(),
     );
 
@@ -261,6 +273,8 @@ pub async fn spawn_services(
 
     #[cfg(feature = "metrics")]
     let network_state_metrics = network_state_sync::NetworkStateMetrics::register(metrics_registry);
+    #[cfg(feature = "metrics")]
+    let substate_cache_metrics = crate::substate_cache::SubstateCacheMetrics::register(metrics_registry);
 
     // Shared between the state sync (which confirms how far each shard is synced) and the substate
     // cache (which serves an entry only while its shard is being kept up with).
@@ -274,6 +288,8 @@ pub async fn spawn_services(
         NetworkWideStateSyncConfig {
             event_filters: Arc::from(config.indexer.event_filters.clone()),
             work_interval: config.indexer.state_scanning_interval,
+            stream_deadline: config.indexer.state_sync_stream_deadline,
+            keepalive_interval: config.indexer.state_sync_keepalive_interval,
             watched_templates: watched_templates.clone(),
         },
         event_notifier.clone(),
@@ -282,6 +298,8 @@ pub async fn spawn_services(
         shard_watermarks.clone(),
         #[cfg(feature = "metrics")]
         network_state_metrics,
+        #[cfg(feature = "metrics")]
+        substate_cache_metrics.clone(),
         #[cfg(feature = "metrics")]
         consensus_constants.clone(),
     )
@@ -292,37 +310,42 @@ pub async fn spawn_services(
         store.clone(),
         shard_watermarks,
         config.indexer.substate_cache_max_serve_lag,
+        config.indexer.state_sync_keepalive_interval * NEGATIVE_SERVE_KEEPALIVES,
         SUBSTATE_CACHE_JOURNAL_RETENTION,
         DEFAULT_CACHE_TTL,
         config.indexer.substate_cache_max_entries,
     );
+    #[cfg(feature = "metrics")]
+    let substate_cache = substate_cache.with_metrics(substate_cache_metrics);
     substate_cache.spawn_pruner(SUBSTATE_CACHE_PRUNE_INTERVAL, shutdown.clone());
     let substate_manager = SubstateManager::new(
         config.network,
         store.clone(),
         epoch_manager.clone(),
         validator_node_client_factory.clone(),
-        substate_cache,
+        substate_cache.clone(),
     )
-    .with_substate_proof_verification(config.indexer.verify_substate_proofs);
+    .with_substate_proof_verification(config.indexer.verify_substate_proofs)
+    .with_negative_cache_ttl(config.indexer.substate_cache_negative_ttl);
     #[cfg(feature = "metrics")]
     let substate_manager = substate_manager.with_metrics(metrics_registry);
 
     // Template manager
     let wasm_cache_dir = config.to_data_dir().join("wasm_cache");
+    // One instance serves every consumer of the directory, each holding a clone.
+    let wasm_cache = WasmModuleCache::open(&wasm_cache_dir).map_err(|e| {
+        anyhow!(
+            "Failed to open WASM module cache at {}: {}",
+            wasm_cache_dir.display(),
+            e,
+        )
+    })?;
 
     let template_manager = task::spawn_blocking({
         let global_db = global_db.clone();
         let substate_manager = substate_manager.clone();
-        let wasm_cache_dir = wasm_cache_dir.clone();
+        let wasm_cache = wasm_cache.clone();
         move || {
-            let wasm_cache = WasmModuleCache::open(&wasm_cache_dir).map_err(|e| {
-                anyhow!(
-                    "Failed to open WASM module cache at {}: {}",
-                    wasm_cache_dir.display(),
-                    e,
-                )
-            })?;
             let manager = TemplateManager::initialize(global_db, substate_manager, wasm_cache)?;
             anyhow::Ok(manager)
         }
@@ -330,12 +353,21 @@ pub async fn spawn_services(
     .await
     .context("template manager init thread panicked")??;
 
-    // Dry run - use a shorter cache TTL for more accurate fee estimates. Proof verification is left
-    // off here: dry run only produces a fee estimate, and gating it on proof availability would make
-    // transaction submission fragile when proofs are momentarily unavailable.
+    // Dry run - use a shorter cache TTL for more accurate fee estimates. A nonexistent input is held
+    // for the shorter of the two: an input resolved as absent estimates a transaction that would in
+    // fact have succeeded, which is the same staleness `dry_run_cache_ttl` is set to bound.
+    // Proof verification is left off here: dry run only produces a fee estimate, and gating it on
+    // proof availability would make transaction submission fragile when proofs are momentarily
+    // unavailable.
     let dry_run_substate_manager = substate_manager
         .clone()
         .with_cache_ttl(config.indexer.dry_run_cache_ttl)
+        .with_negative_cache_ttl(
+            config
+                .indexer
+                .dry_run_cache_ttl
+                .min(config.indexer.substate_cache_negative_ttl),
+        )
         .with_substate_proof_verification(false);
     let fee_table = get_fee_table_by_network(config.network);
     let dry_run_transaction_processor = DryRunTransactionProcessor::new(
@@ -343,7 +375,7 @@ pub async fn spawn_services(
         fee_table.clone(),
         epoch_manager.clone(),
         dry_run_substate_manager,
-        wasm_cache_dir,
+        wasm_cache,
         // We do not verify the kernel merkle proof, since that requires syncing L1 headers
         // TODO: maybe at least validate the well-formedness of the proof
         KnowledgeProofVerifier::new(
@@ -391,6 +423,7 @@ pub async fn spawn_services(
             create_gossip_transaction_validator(
                 config.network,
                 consensus_constants.max_transaction_weight,
+                consensus_constants.max_transaction_size_bytes,
                 consensus_constants.max_transaction_validity_epochs,
             ),
             consensus_constants.max_transaction_validity_epochs,
@@ -407,7 +440,9 @@ pub async fn spawn_services(
         store.clone(),
         config.network,
         consensus_constants.max_transaction_weight,
+        consensus_constants.max_transaction_size_bytes,
         consensus_constants.max_transaction_validity_epochs,
+        substate_cache,
     );
 
     // Save final node identity after comms has initialized. This is required because the public_address can be
@@ -415,6 +450,7 @@ pub async fn spawn_services(
     save_identities(config, &keypair)?;
     Ok(Services {
         network: config.network,
+        consensus_constants: consensus_constants.clone(),
         published_config: PublishedIndexerConfig::from(&config.indexer),
         keypair,
         networking,
@@ -435,6 +471,7 @@ pub async fn spawn_services(
 
 pub struct Services {
     pub network: Network,
+    pub consensus_constants: ConsensusConstants,
     pub published_config: PublishedIndexerConfig,
     pub keypair: RistrettoKeypair,
     pub networking: NetworkingHandle<TariMessagingSpec>,
@@ -506,7 +543,7 @@ async fn create_epoch_oracle<TStore: EpochOracleStore + BaseLayerBlockHeaderStor
     }
 }
 
-async fn create_base_layer_epoch_oracle<TStore: EpochOracleStore + BaseLayerBlockHeaderStore + 'static>(
+async fn create_base_layer_epoch_oracle<TStore: EpochOracleStore + BaseLayerBlockHeaderStore + Clone + 'static>(
     config: &ApplicationConfig,
     store: TStore,
     consensus_constants: &ConsensusConstants,
@@ -525,7 +562,6 @@ async fn create_base_layer_epoch_oracle<TStore: EpochOracleStore + BaseLayerBloc
                 sync_headers: false,
                 sync_validator_node_changes: true,
             },
-            epoch_end_spread_blocks: consensus_constants.epoch_end_spread_blocks,
         },
         config.network,
     ))

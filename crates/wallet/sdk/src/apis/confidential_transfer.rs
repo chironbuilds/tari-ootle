@@ -145,7 +145,7 @@ where TSpec: WalletSdkSpec
                 })
             },
             UtxoInputSelection::PreferRevealed => {
-                let revealed_to_spend = cmp::min(src_vault.revealed_balance, spend_amount);
+                let revealed_to_spend = cmp::min(available_revealed_funds, spend_amount);
                 let confidential_to_spend = spend_amount - revealed_to_spend;
                 if confidential_to_spend.is_zero() {
                     info!(
@@ -386,7 +386,10 @@ where TSpec: WalletSdkSpec
                 inputs_to_spend.revealed, params.amount
             )
         });
-        let change_confidential_amount = inputs_to_spend.total_confidential_amount() - remaining_left_to_pay;
+        let change_confidential_amount = inputs_to_spend
+            .total_confidential_amount()
+            .checked_sub(remaining_left_to_pay)
+            .ok_or(ConfidentialTransferApiError::InsufficientFunds)?;
 
         let maybe_change_statement = if change_confidential_amount.is_positive() {
             let statement = self.create_confidential_proof_statement(
@@ -444,10 +447,22 @@ where TSpec: WalletSdkSpec
                     builder
                 }
             })
-            .call_method(*from_account.component_address(), "withdraw_confidential", args![
-                params.resource_address,
-                proof
-            ])
+            .then(|builder| {
+                // The badge authorizes the resource's withdraw rule inside the account's frame, which it
+                // reaches as a `Proof` argument.
+                if params.proof_from_resource.is_some() {
+                    builder.call_method(
+                        *from_account.component_address(),
+                        "withdraw_confidential_with_auth",
+                        args![params.resource_address, proof, Workspace("proof")],
+                    )
+                } else {
+                    builder.call_method(*from_account.component_address(), "withdraw_confidential", args![
+                        params.resource_address,
+                        proof
+                    ])
+                }
+            })
             .put_last_instruction_output_on_workspace("bucket")
             .call_method(to_account.address, "deposit", args![Workspace("bucket")])
             .then(|builder| {

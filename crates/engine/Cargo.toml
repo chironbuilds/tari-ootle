@@ -22,24 +22,33 @@ tari_ootle_transaction = { workspace = true, features = ["serde"] }
 ootle_byte_type = { workspace = true }
 
 blake2 = { workspace = true }
+digest = { workspace = true }
+sha2 = { workspace = true }
+sha3 = { workspace = true }
 log = { workspace = true, features = ["std"] }
 rand = { workspace = true }
 indexmap = { workspace = true }
 serde = { workspace = true, default-features = true }
 thiserror = { workspace = true }
 wasmer = { workspace = true, features = ["cranelift"] }
-wasmer-middlewares = { workspace = true }
+tari-wasmer-middlewares = { workspace = true }
 bytes = { workspace = true, optional = true }
 memmap2 = { workspace = true, optional = true }
+crc32fast = { workspace = true, optional = true }
 
 [features]
 default = []
+# Instruments the WASM ABI boundary (`tari_engine::abi_metrics`) so
+# `examples/abi_measure.rs` can attribute host time and wire bytes per engine
+# op. Measurement only: it adds two clock reads per ABI phase and is never
+# enabled by a validator build.
+abi-metrics = ["tari_template_lib/metrics"]
 # Enables the on-disk wasmer module cache (`tari_engine::wasm::cache`). Pulls
 # in `tari_template_builtin` to bypass caching for builtin addresses, plus the
 # filesystem I/O surface (memmap + bytes). Disable if embedding the engine in
 # an environment where a local data directory isn't available or isn't
 # desirable.
-wasm-cache = ["dep:bytes", "dep:memmap2"]
+wasm-cache = ["dep:bytes", "dep:memmap2", "dep:crc32fast"]
 
 [dev-dependencies]
 # Path-only (no version) to break the circular dev-dep: tari_template_test_tooling
@@ -61,6 +70,7 @@ criterion = { version = "0.8.1", features = ["html_reports"] }
 minicbor = { workspace = true, default-features = false, features = ["alloc", "derive"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+wat = "1.258"
 
 
 [[bench]]

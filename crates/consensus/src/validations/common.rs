@@ -11,13 +11,14 @@ use tari_ootle_common_types::{
     ExtraFieldKey,
     NodeHeight,
     NumPreshards,
+    ProtocolVersion,
     ShardGroup,
     VotePower,
     committee::Committee,
 };
 use tari_ootle_storage::consensus_models::{Block, BlockHeader};
 use tari_ootle_transaction::Network;
-use tari_sidechain::ProposalCertificateSignatureFields;
+use tari_sidechain::ProposalVoteMessage;
 use tari_template_lib_types::crypto::RistrettoPublicKeyBytes;
 
 use crate::{
@@ -49,6 +50,22 @@ pub(super) fn check_network(header: &BlockHeader, network: Network) -> Result<()
         return Err(ProposalValidationError::InvalidNetwork {
             block_network: header.network().to_string(),
             expected_network: network.to_string(),
+            block_id: *header.id(),
+        });
+    }
+    Ok(())
+}
+
+/// The protocol version a block is produced under is fixed by the network's activation schedule at the block's
+/// epoch. A node whose schedule disagrees rejects the block instead of hashing it under a schema the rest of the
+/// network has left behind, which stalls the node rather than forking it.
+pub(super) fn check_protocol_version(header: &BlockHeader, network: Network) -> Result<(), ProposalValidationError> {
+    let expected_version = ProtocolVersion::at(network, header.epoch());
+    if header.protocol_version() != expected_version {
+        return Err(ProposalValidationError::InvalidProtocolVersion {
+            expected_version,
+            block_version: header.protocol_version(),
+            epoch: header.epoch(),
             block_id: *header.id(),
         });
     }
@@ -142,7 +159,7 @@ pub(super) fn check_height(block: &Block) -> Result<(), ProposalValidationError>
     }
     let max_certificate_height = block.max_certificate_height();
     // invariant: the block may only advance the view by 1 higher than the justified height
-    if block.height() != max_certificate_height + NodeHeight(1) {
+    if max_certificate_height.checked_add(NodeHeight(1)) != Some(block.height()) {
         return Err(ProposalValidationError::InvalidBlockHeight {
             block_id: *block.id(),
             block_height: block.height(),
@@ -157,7 +174,16 @@ pub(super) fn check_proposed_by_leader<TAddr: DerivableFromPublicKey, TLeaderStr
     local_committee: &Committee<TAddr>,
     block: &Block,
 ) -> Result<(), ProposalValidationError> {
-    let (addr, leader) = leader_strategy.get_leader(local_committee, block.height() - NodeHeight(1));
+    let parent_height =
+        block
+            .height()
+            .checked_sub(NodeHeight(1))
+            .ok_or_else(|| ProposalValidationError::InvalidBlockHeight {
+                block_id: *block.id(),
+                block_height: block.height(),
+                details: "Block height is zero".to_string(),
+            })?;
+    let (addr, leader) = leader_strategy.get_leader(local_committee, parent_height);
     if leader != block.proposed_by() {
         return Err(ProposalValidationError::NotLeader {
             proposed_by: block.proposed_by().to_string(),
@@ -201,6 +227,7 @@ pub(super) fn check_block_signature<TSignerService: ValidatorSignatureVerifierSe
 }
 
 pub(super) fn check_proposal_certificate<TConsensusSpec: ConsensusSpec>(
+    network: Network,
     candidate_block: &Block,
     committee: &Committee<TConsensusSpec::Addr>,
     signing_service: &TConsensusSpec::SignerService,
@@ -213,12 +240,13 @@ pub(super) fn check_proposal_certificate<TConsensusSpec: ConsensusSpec>(
         });
     }
 
-    check_quorum_certificate_signatures::<TConsensusSpec>(qc.into(), committee, signing_service)?;
+    check_quorum_certificate_signatures::<TConsensusSpec>(network, qc.into(), committee, signing_service)?;
 
     Ok(())
 }
 
 pub(super) fn check_timeout_certificate<TConsensusSpec: ConsensusSpec>(
+    network: Network,
     candidate_block: &Block,
     committee: &Committee<TConsensusSpec::Addr>,
     signing_service: &TConsensusSpec::SignerService,
@@ -233,7 +261,7 @@ pub(super) fn check_timeout_certificate<TConsensusSpec: ConsensusSpec>(
         });
     }
 
-    check_quorum_certificate_signatures::<TConsensusSpec>(tc.into(), committee, signing_service)?;
+    check_quorum_certificate_signatures::<TConsensusSpec>(network, tc.into(), committee, signing_service)?;
 
     Ok(())
 }
@@ -241,6 +269,7 @@ pub(super) fn check_timeout_certificate<TConsensusSpec: ConsensusSpec>(
 /// Validates the signatures of the quorum certificate.
 // pub because used in on receive NEWVIEW
 pub fn check_quorum_certificate_signatures<TConsensusSpec: ConsensusSpec>(
+    network: Network,
     qc: QuorumCertificateRef<'_>,
     committee: &Committee<TConsensusSpec::Addr>,
     signing_service: &TConsensusSpec::SignerService,
@@ -282,10 +311,15 @@ pub fn check_quorum_certificate_signatures<TConsensusSpec: ConsensusSpec>(
         match qc {
             QuorumCertificateRef::ProposalCertificate(pc) => {
                 let block_id = pc.calculate_block_id();
-                let message = ProposalCertificateSignatureFields {
-                    block_id: block_id.hash(),
-                    decision: pc.decision(),
-                };
+                // `check_protocol_version` pins a block's version to `at(network, header.epoch())` before any vote
+                // is cast on it, so resolving from the schedule here yields the version the signers used.
+                let message = ProposalVoteMessage::new(
+                    ProtocolVersion::at(network, pc.epoch()).as_u32(),
+                    block_id.hash(),
+                    pc.decision(),
+                    pc.epoch().as_u64(),
+                    pc.height().as_u64(),
+                );
                 let vote = SignedProposalVote { message, signature };
                 let is_valid = signing_service.verify(&vote);
                 if !is_valid {

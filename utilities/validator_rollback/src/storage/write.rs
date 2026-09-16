@@ -299,7 +299,7 @@ where
     const OPERATION: &str = "rollback_delete_after_epoch";
 
     let mut stats = RollbackDeleteStats::default();
-    let start_epoch = target_epoch + Epoch(1);
+    let start_epoch = target_epoch.saturating_add(Epoch(1));
 
     // 1. Collect block_ids where epoch > target. We collect first so that per-block cascade helpers (which take `&mut
     //    self`) can run without holding an immutable CF-handle borrow over the iteration.
@@ -311,13 +311,8 @@ where
 
     for (epoch, height, block_id) in &to_delete {
         // Load the block before deleting so we can walk its commands and clean up per-tx
-        // records that the block-id-keyed cascade below doesn't cover. Specifically,
-        // `transactions_finalize_all` prunes the (block_id, tx_id, height) index on
-        // finalize; that leaves `block_transaction_executions_remove_any_by_block_id`
-        // with nothing to scan for already-finalized transactions, so their
-        // `BlockTransactionExecutionCf` rows + `FinalizedTransactionLinkCf` link would
-        // otherwise survive the rollback and let `get_transaction_result` keep returning
-        // the committed execution.
+        // records that the block-id-keyed cascade below doesn't cover, keyed as they are
+        // by transaction id alone.
         let block = tx.db().cf(BlockCf)?.get(block_id, OPERATION)?;
 
         // Per-block cascades via existing helpers. Keeps this list consistent with what
@@ -331,17 +326,20 @@ where
         tx.transaction_pool_state_updates_remove_any_by_block_id(block_id)?;
         tx.lock_conflicts_remove_by_block_id(block_id)?;
 
-        // Clean up finalized execution records for transactions in this block. The
-        // `BlockTransactionExecutionCf` row is keyed by (tx_id, block_id, height) and is
-        // inserted at the block where the transaction was executed (Prepare for
-        // multi-stage, this block itself for LocalOnly). Attempting to delete at
-        // (tx_id, this_block_id, this_block_height) is correct for LocalOnly rows and a
-        // no-op otherwise — the Prepare block's own iteration will catch its own row.
+        // A database written before the block index outlived transaction finalization has no
+        // index entry for a finalized transaction's execution, so the block-id cascade above
+        // reaches nothing for it. Deleting at this block's own key covers those rows: it is
+        // exact for a LocalOnly execution recorded here and a no-op otherwise, where the
+        // block that did record it deletes its own row on its turn through this loop. An
+        // execution that survives the rollback is worse than a leaked row — its block is no
+        // longer in the pending chain index, so `block_transaction_executions_get_pending_for_block`
+        // reads it as committed, hence an ancestor, hence reusable, and a re-sequenced
+        // transaction reuses an execution pinned to already-spent input versions.
         let exec_cf = tx.db().cf(BlockTransactionExecutionCf)?;
-        let finalized_link_cf = tx.db().cf(FinalizedTransactionLinkCf)?;
         for tx_id in block.all_transaction_ids() {
             exec_cf.delete(&(*tx_id, *block_id, *height), OPERATION)?;
         }
+        let finalized_link_cf = tx.db().cf(FinalizedTransactionLinkCf)?;
         // Finalising commands mark this block as where the transaction's finalize QC
         // committed, so `FinalizedTransactionLinkCf[tx_id]` was written here. Deleting it
         // restores the "not-yet-finalized" state so `finalized_transaction_execution_get`

@@ -55,6 +55,12 @@ impl TransactionError {
             TransactionErrorKind::WasmExecutionError(WasmExecutionError::RuntimeError(err)) => {
                 err.to_reject_reason(self.instruction_idx)
             },
+            // The paid fee did not fund the WASM the transaction ran. Paying more is what fixes it, so it reports
+            // as a fee shortfall. `WasmExecutionError::FeeIntentComputeExceeded` is a flat credit that a larger
+            // fee does not raise, so it stays an execution failure.
+            TransactionErrorKind::WasmExecutionError(WasmExecutionError::InsufficientFeesForCompute { .. }) => {
+                RejectReason::InsufficientFeesPaid(self.to_string())
+            },
             _ => RejectReason::ExecutionFailure(self.to_string()),
         }
     }
@@ -124,6 +130,8 @@ pub enum TransactionErrorKind {
     NotAMigrationFunction { name: String },
     #[error("Migration functions cannot be called directly: {name}")]
     CannotCallMigrationFunctionDirectly { name: String },
+    #[error("The account constructor cannot be called directly. Use the CreateAccount instruction.")]
+    CannotCallAccountConstructor,
     #[error("Invalid CreateAccount operation for component {component_address}: {details}")]
     InvalidCreateAccount {
         component_address: ComponentAddress,

@@ -44,12 +44,10 @@ const FEE_SOURCE_LABELS: Record<string, string> = {
   RuntimeCall: "Runtime calls",
   Storage: "Storage",
   TransactionWeight: "Transaction weight",
-  SignatureVerification: "Signature verification",
   TemplateLoad: "Template load",
   SubstateCreate: "Substate creation",
   WasmExecution: "WASM execution",
   TemplatePublish: "Template publish",
-  ExhaustBurn: "Exhaust burn",
 };
 
 interface FeeInformationProps extends FeeReceipt {

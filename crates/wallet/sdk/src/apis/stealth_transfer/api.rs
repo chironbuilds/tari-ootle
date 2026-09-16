@@ -14,7 +14,7 @@ use tari_engine_types::{
 };
 use tari_ootle_address::{OotleAddress, RistrettoOotleAddress};
 use tari_ootle_common_types::{SubstateRequirement, displayable::Displayable, optional::Optional};
-use tari_ootle_transaction::{Transaction, UnsignedTransaction, args};
+use tari_ootle_transaction::{Transaction, TransactionBuilder, UnsignedTransaction, args};
 use tari_ootle_wallet_crypto::{memo::Memo, pay_to::PayTo};
 use tari_template_lib::{
     models::Account as BuiltinAccount,
@@ -44,7 +44,13 @@ use crate::{
         config::ConfigApi,
         key_manager::KeyManagerApi,
         locks::LocksApi,
-        stealth_outputs::{StealthOutputsApi, StealthOutputsApiError, TransferStatementParams},
+        stealth_outputs::{
+            FEE_INTENT_INPUT_RESERVE,
+            MAX_TRANSFER_INPUTS,
+            StealthOutputsApi,
+            StealthOutputsApiError,
+            TransferStatementParams,
+        },
         substate::{SubstatesApi, ValidatorScanResult},
         swap_pool,
     },
@@ -108,7 +114,12 @@ impl<'a, TSpec: WalletSdkSpec> StealthTransferApi<'a, TSpec> {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    /// Locks the inputs a transfer statement will spend, leaving [`FEE_INTENT_INPUT_RESERVE`] of the transaction's
+    /// input budget for a statement that sources the fee.
+    ///
+    /// The reserve is held back unconditionally, including on the merged-statement path that may not need a fee
+    /// statement at all: whether the merge fits the fee-intent credit is only known once the realised input count is,
+    /// which is after selection, and a selection that had already claimed the whole budget could not then fall back.
     pub fn lock_inputs_for_transfer(
         &self,
         lock_id: WalletLockId,
@@ -116,6 +127,26 @@ impl<'a, TSpec: WalletSdkSpec> StealthTransferApi<'a, TSpec> {
         resource_address: ResourceAddress,
         spend_amount: Amount,
         input_selection: UtxoInputSelection,
+    ) -> Result<InputsToSpend, StealthTransferApiError> {
+        self.lock_inputs_within_budget(
+            lock_id,
+            owner_account_component_address,
+            resource_address,
+            spend_amount,
+            input_selection,
+            MAX_TRANSFER_INPUTS,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn lock_inputs_within_budget(
+        &self,
+        lock_id: WalletLockId,
+        owner_account_component_address: &ComponentAddress,
+        resource_address: ResourceAddress,
+        spend_amount: Amount,
+        input_selection: UtxoInputSelection,
+        max_inputs: usize,
     ) -> Result<InputsToSpend, StealthTransferApiError> {
         if !spend_amount.is_positive() {
             return Err(StealthTransferApiError::InvalidParameter {
@@ -141,6 +172,7 @@ impl<'a, TSpec: WalletSdkSpec> StealthTransferApi<'a, TSpec> {
                     &resource_address,
                     lock_id,
                     spend_amount,
+                    max_inputs,
                 )?;
 
                 info!(
@@ -228,6 +260,7 @@ impl<'a, TSpec: WalletSdkSpec> StealthTransferApi<'a, TSpec> {
                     &resource_address,
                     lock_id,
                     utxo_amount_to_spend,
+                    max_inputs,
                 )?;
 
                 let total_confidential_spent = inputs.iter().map(|i| Amount::from(i.value)).sum::<Amount>();
@@ -259,6 +292,7 @@ impl<'a, TSpec: WalletSdkSpec> StealthTransferApi<'a, TSpec> {
                     &resource_address,
                     spend_amount,
                     lock_id,
+                    max_inputs,
                 )?;
 
                 let revealed_to_spend = spend_amount.saturating_sub(blinded_amount_locked);
@@ -306,12 +340,13 @@ impl<'a, TSpec: WalletSdkSpec> StealthTransferApi<'a, TSpec> {
             Some(swap) => (swap.input_resource, swap.input_amount),
             None => (TARI_TOKEN, max_fee.into()),
         };
-        self.lock_inputs_for_transfer(
+        self.lock_inputs_within_budget(
             lock_id,
             owner_account_address,
             resource,
             amount,
             fee_params.input_selection,
+            FEE_INTENT_INPUT_RESERVE,
         )
     }
 
@@ -1018,19 +1053,23 @@ impl<'a, TSpec: WalletSdkSpec> StealthTransferApi<'a, TSpec> {
                 // but a plain withdraw is more fee-efficient.
                 let has_no_inputs_or_outputs = transfer_statement.outputs_statement.outputs.is_empty() && transfer_statement.inputs_statement.inputs.is_empty();
                 if has_no_inputs_or_outputs {
-                    return builder.call_method(*owner_account.component_address(), "withdraw", args![
+                    return withdraw_from_account(
+                        builder,
+                        *owner_account.component_address(),
                         params.resource_address,
-                        revealed_input_amount
-                    ])
-                    ;
+                        revealed_input_amount,
+                        &params.badge_usage,
+                    );
                 }
 
                 if revealed_input_amount.is_positive() {
-                    builder
-                        .call_method(owner_account.account.component_address, "withdraw", args![
-                            params.resource_address,
-                            revealed_input_amount
-                        ])
+                    withdraw_from_account(
+                        builder,
+                        owner_account.account.component_address,
+                        params.resource_address,
+                        revealed_input_amount,
+                        &params.badge_usage,
+                    )
                         .put_last_instruction_output_on_workspace("input_bucket")
                         .stealth_transfer_with_input_bucket(params.resource_address, transfer_statement, "input_bucket")
                 } else {
@@ -1119,17 +1158,23 @@ impl<'a, TSpec: WalletSdkSpec> StealthTransferApi<'a, TSpec> {
                         let has_no_inputs_or_outputs = transfer_statement.outputs_statement.outputs.is_empty() &&
                             transfer_statement.inputs_statement.inputs.is_empty();
                         if has_no_inputs_or_outputs {
-                            return b.call_method(account_address, "withdraw", args![
+                            return withdraw_from_account(
+                                b,
+                                account_address,
                                 params.resource_address,
-                                revealed_input_amount
-                            ]);
+                                revealed_input_amount,
+                                &params.badge_usage,
+                            );
                         }
 
                         if revealed_input_amount.is_positive() {
-                            b.call_method(account_address, "withdraw", args![
+                            withdraw_from_account(
+                                b,
+                                account_address,
                                 params.resource_address,
-                                revealed_input_amount
-                            ])
+                                revealed_input_amount,
+                                &params.badge_usage,
+                            )
                             .put_last_instruction_output_on_workspace("input_bucket")
                             .stealth_transfer_with_input_bucket(
                                 params.resource_address,
@@ -1220,6 +1265,27 @@ impl<'a, TSpec: WalletSdkSpec> StealthTransferApi<'a, TSpec> {
             is_condition_spendable: self.outputs_api.is_spendable_auth(&output.auth),
         })?;
         Ok(())
+    }
+}
+
+/// Withdraws `amount` of `resource` from the owner's account, handing the badge proof to the account's frame when
+/// one is in use. A frame authorizes with the badges it is stamped with and the proofs it is passed as arguments,
+/// so a badge reaches the account's withdraw rule as an argument.
+fn withdraw_from_account<D>(
+    builder: TransactionBuilder<D>,
+    account: ComponentAddress,
+    resource: ResourceAddress,
+    amount: Amount,
+    badge_usage: &BadgeUsage,
+) -> TransactionBuilder<D> {
+    if badge_usage.is_none() {
+        builder.call_method(account, "withdraw", args![resource, amount])
+    } else {
+        builder.call_method(account, "withdraw_with_auth", args![
+            resource,
+            amount,
+            Workspace("proof")
+        ])
     }
 }
 

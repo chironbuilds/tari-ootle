@@ -12,7 +12,7 @@ use tari_engine_types::{
     fees::FeeBreakdown,
     substate::SubstateDiff,
 };
-use tari_ootle_common_types::{Epoch, ExtraData, NodeHeight, SubstateRequirement};
+use tari_ootle_common_types::{Epoch, ExtraData, NodeHeight, ProtocolVersion, SubstateRequirement};
 use tari_ootle_storage::{
     StateStore,
     StateStoreReadTransaction,
@@ -63,6 +63,7 @@ mod confirm_all_transitions {
 
         let block1 = Block::create(
             network,
+            ProtocolVersion::V0,
             *zero_block.id(),
             zero_block.justify().clone(),
             None,
@@ -170,6 +171,7 @@ mod confirm_all_transitions {
 
         let block1 = Block::create(
             network,
+            ProtocolVersion::V0,
             *zero_block.id(),
             zero_block.justify().clone(),
             None,
@@ -342,6 +344,7 @@ mod transaction_execution_operations {
                         total_fees_paid: 0,
                         total_fee_overcharge: 0,
                         cost_breakdown: FeeBreakdown::default(),
+                        exhaust_burn: 0,
                     }
                     .build(),
                 ),
@@ -372,6 +375,7 @@ mod transaction_execution_operations {
                         total_fees_paid: 0,
                         total_fee_overcharge: 0,
                         cost_breakdown: FeeBreakdown::default(),
+                        exhaust_burn: 0,
                     }
                     .build(),
                 ),
@@ -424,6 +428,14 @@ mod transaction_execution_operations {
 
         let rec = tx.transactions_get(tx1.id()).unwrap();
         assert!(rec.is_finalized(&*tx).unwrap(), "Transaction should be finalized");
+
+        // Finalizing must not orphan the block index: block-scoped cascades and block introspection still need to
+        // reach a finalized transaction's execution through the block it was executed in.
+        let all = tx
+            .block_transaction_executions_get_all_for_block(not_committed_block.id())
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq_debug(&all[0], &exec1);
 
         let pending = tx
             .block_transaction_executions_get_pending_for_block(tx2.id(), &not_committed_block.as_leaf())
@@ -484,6 +496,7 @@ mod transaction_execution_operations {
                         total_fees_paid: 0,
                         total_fee_overcharge: 0,
                         cost_breakdown: FeeBreakdown::default(),
+                        exhaust_burn: 0,
                     }
                     .build(),
                 ),
@@ -679,6 +692,7 @@ mod get_many_ready_weight_budget {
         let atoms: Vec<_> = weights.iter().map(|_| create_tx_atom()).collect();
         let block1 = Block::create(
             network,
+            ProtocolVersion::V0,
             *zero_block.id(),
             zero_block.justify().clone(),
             None,

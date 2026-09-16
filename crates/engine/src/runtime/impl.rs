@@ -20,7 +20,7 @@
 //   WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
 //   USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-use std::sync::{Arc, atomic, atomic::AtomicPtr};
+use std::{ptr::NonNull, rc::Rc, sync::Arc};
 
 use log::{warn, *};
 use tari_bor::{MaybeTagged, decode_exact};
@@ -41,6 +41,7 @@ use tari_engine_types::{
     indexed_value::{IndexedValue, IndexedWellKnownTypes},
     instruction_result::InstructionResult,
     limits,
+    limits::ModuleShape,
     lock::LockFlag,
     logs::LogEntry,
     proof::{ContainerRef, LockedResource},
@@ -51,7 +52,7 @@ use tari_engine_types::{
     substate::{SubstateId, SubstateValue},
     vault::Vault,
 };
-use tari_ootle_common_types::{GetVerifier, services::template_provider::TemplateProvider};
+use tari_ootle_common_types::services::template_provider::TemplateProvider;
 use tari_ootle_template_metadata::MetadataHash;
 use tari_ootle_transaction::{
     AllocatableAddressType,
@@ -101,6 +102,7 @@ use tari_template_lib::{
         SpendContextAction,
         StealthTransferResourceArg,
         UpdateAccessRuleArg,
+        UpdateAuthHookArg,
         VaultAction,
         VaultCreateProofByFungibleAmountArg,
         VaultCreateProofByNonFungiblesArg,
@@ -124,6 +126,7 @@ use tari_template_lib::{
         Metadata,
         NonFungibleAddress,
         OwnerRule,
+        ResourceAddress,
         ResourceInfo,
         ResourceType,
         SubstateOwnerRule,
@@ -132,9 +135,9 @@ use tari_template_lib::{
         ValidatorFeePoolAddress,
         access_rules::{ComponentAccessRules, ResourceAuthAction, UpdateRule},
         bytes::Bytes,
-        constants::{IMAGE_URL, TARI_TOKEN, TOKEN_SYMBOL},
+        constants::{TARI_TOKEN, TOKEN_SYMBOL},
         crypto::{PedersenCommitmentBytes, RistrettoPublicKeyBytes, UtxoTag},
-        engine_args::{SignatureAction, SignatureVerifyArg},
+        engine_args::IntrinsicId,
         metadata,
         stealth::{
             AtomicCondition,
@@ -161,6 +164,7 @@ use super::{
     working_state::WorkingState,
 };
 use crate::{
+    intrinsics,
     runtime::{
         RuntimeError,
         RuntimeInterface,
@@ -168,7 +172,7 @@ use crate::{
         error::{ArgumentValidationError, LimitError},
         locking::{LockError, LockedSubstate},
         pay_fee::PayFee,
-        scope::PushCallFrame,
+        scope::{FrameWriteMode, PushCallFrame},
         tracker::{ComputeAllowance, FinalizedState, StateTracker},
     },
     state_store::StateReader,
@@ -188,17 +192,17 @@ pub struct RuntimeInterfaceImpl<TStore, TTemplateProvider> {
     claim_burn_proof_verifier: Arc<dyn ClaimProofVerifier + Send + Sync + 'static>,
     /// Transaction blob payloads, immutable for the duration of execution. Used to resolve
     /// `InstructionArg::Blob(idx)` references against the surrounding transaction's blobs.
-    blobs: Arc<tari_ootle_transaction::Blobs>,
+    blobs: Rc<tari_ootle_transaction::Blobs>,
     /// A pointer to the runtime that is set after initialization to allow for cross-template calls.
-    /// This is using an atomic pointer simply to make RuntimeInterfaceImpl Send + Sync to satisfy wasmer trait bounds.
-    runtime_pointer: Option<AtomicPtr<Box<dyn RuntimeInterface>>>,
+    runtime_pointer: Option<NonNull<Box<dyn RuntimeInterface>>>,
     /// The introspection context made available to a spend-script predicate for the duration of its evaluation. It is
     /// set immediately before invoking the predicate and cleared immediately after, so `spend_context_invoke` (which
     /// re-enters this same interface through the runtime pointer) can serve the `SpendContext` accessors.
     spend_exec_context: Option<SpendScriptExecution>,
-    /// One-shot flag: when set, the next pushed call frame is restricted to a read-only, non-cross-template sandbox
-    /// (used for the spend-script predicate frame). Consumed by `push_call_frame`.
-    restricted_frame_pending: bool,
+    /// One-shot: when set, the next pushed call frame is restricted to this write mode and denied cross-template
+    /// calls. Used for the spend-script predicate frame (`ReadOnly`) and the resource auth hook frame
+    /// (`OwnComponent`). Consumed by `push_call_frame`.
+    restricted_frame_pending: Option<FrameWriteMode>,
 }
 
 impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<Template = LoadedTemplate>>
@@ -211,7 +215,7 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
         entity_id_provider: EntityIdProvider,
         modules: ModulesCollection<TStore>,
         claim_burn_proof_verifier: Arc<dyn ClaimProofVerifier + Send + Sync + 'static>,
-        blobs: Arc<tari_ootle_transaction::Blobs>,
+        blobs: Rc<tari_ootle_transaction::Blobs>,
     ) -> Result<Self, RuntimeError> {
         let mut runtime = Self {
             tracker,
@@ -223,7 +227,7 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
             blobs,
             runtime_pointer: None,
             spend_exec_context: None,
-            restricted_frame_pending: false,
+            restricted_frame_pending: None,
         };
         runtime.invoke_modules_on_initialize()?;
         Ok(runtime)
@@ -237,40 +241,51 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
     }
 
     fn invoke_modules_on_runtime_call(&mut self, function: &'static str) -> Result<(), RuntimeError> {
-        // Core read-only sandbox enforcement runs first and unconditionally. It deliberately does NOT live in a
+        // Core sandbox enforcement runs first and unconditionally. It deliberately does NOT live in a
         // RuntimeModule: modules are optional, observer-style functionality (fees, call tracking), so making a
         // security invariant depend on one would mean dropping that module silently re-opens the sandbox. This is the
         // single per-host-op entry point, so enforcing here covers every op that routes through it regardless of
         // which modules are registered.
-        self.enforce_read_only_restrictions(function)?;
+        self.enforce_frame_restrictions(function)?;
         for module in self.modules.iter() {
             module.on_runtime_call(&mut self.tracker, function)?;
         }
         Ok(())
     }
 
-    /// Layer (b) of the spend-script sandbox: deny the effectful or non-deterministic host ops that are NOT mediated by
-    /// the write-lock chokepoint (layer (a) in `WorkingState::write_lock_substate` / `new_substate`, which neutralises
-    /// every state write). Together they make a spend-script predicate provably side-effect-free and deterministic.
+    /// Layer (b) of the frame sandbox: deny the effectful or non-deterministic host ops that are NOT mediated by the
+    /// write-lock chokepoint (layer (a) in `WorkingState::try_lock` / `new_substate`, which neutralises every state
+    /// write). Together they make a spend-script predicate provably side-effect-free and deterministic,
+    /// and confine a resource auth hook to its own component state.
     ///
-    /// The list contains only WASM host ops (each backed by an `EngineOp`), because a read-only frame only exists while
-    /// a predicate's WASM is executing — instruction-level operations such as `pay_fee` and `publish_template` have no
-    /// `EngineOp`, run only at the top level, and so can never execute in a read-only context. `call_invoke` is also
-    /// blocked at the frame level (`allow_cross_template_calls == false`) and listed here for defence in depth.
-    fn enforce_read_only_restrictions(&self, function: &'static str) -> Result<(), RuntimeError> {
+    /// Events are permitted in both modes: an event is an output of execution that no later code can observe, and it
+    /// is discarded with the transaction if the frame fails, so it is neither a side effect on state nor a source of
+    /// non-determinism.
+    ///
+    /// The lists contain only WASM host ops (each backed by an `EngineOp`), because a restricted frame only exists
+    /// while template WASM is executing — instruction-level operations such as `pay_fee` and `publish_template` have
+    /// no `EngineOp`, run only at the top level, and so can never execute in a restricted context. `call_invoke` is
+    /// also blocked at the frame level (`allow_cross_template_calls == false`) and listed here for defence in depth.
+    fn enforce_frame_restrictions(&self, function: &'static str) -> Result<(), RuntimeError> {
         const FORBIDDEN_IN_READ_ONLY: &[&str] = &[
             "call_invoke",
             "generate_random_invoke",
             "generate_uuid",
-            "emit_event",
             "proof_invoke",
             "bucket_invoke",
         ];
+        const FORBIDDEN_IN_OWN_COMPONENT: &[&str] = &["call_invoke", "proof_invoke", "bucket_invoke"];
 
-        if self.tracker.is_in_read_only_context() && FORBIDDEN_IN_READ_ONLY.contains(&function) {
-            return Err(RuntimeError::ForbiddenInReadOnlyContext { operation: function });
+        match self.tracker.current_frame_write_mode() {
+            FrameWriteMode::Full => Ok(()),
+            FrameWriteMode::OwnComponent if FORBIDDEN_IN_OWN_COMPONENT.contains(&function) => {
+                Err(RuntimeError::ForbiddenInAuthHookContext { operation: function })
+            },
+            FrameWriteMode::ReadOnly if FORBIDDEN_IN_READ_ONLY.contains(&function) => {
+                Err(RuntimeError::ForbiddenInReadOnlyContext { operation: function })
+            },
+            FrameWriteMode::OwnComponent | FrameWriteMode::ReadOnly => Ok(()),
         }
-        Ok(())
     }
 
     fn invoke_modules_on_before_finalize(&mut self) -> Result<(), RuntimeError> {
@@ -383,6 +398,16 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
         Ok(())
     }
 
+    /// Emits one of the engine's builtin `std.*` events.
+    ///
+    /// Events are persisted in the transaction receipt and priced by their encoded length, so a
+    /// `payload` entry is paid for by every caller of the instruction that emits it. A payload must
+    /// therefore carry only what a reader cannot recover from the substates the same transaction
+    /// ups: the amount moved, which rule changed, which vault was reached. Anything the reader can
+    /// read off `substate_id` or off a substate it names — a resource's type, symbol or metadata —
+    /// is charged for twice and must stay out. A consumer that needs a substate's contents to
+    /// interpret an event resolves it once and caches it — a vault's resource, for instance, is
+    /// fixed for the vault's life — rather than having every caller pay to carry it.
     fn emit_std_event<T: Into<SubstateId>>(
         object_name: &str,
         action: &str,
@@ -432,19 +457,36 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
             auth_caller.with_component_state(caller.into_component().state);
         }
 
-        // The signature of a call back is (action: ResourceAuthAction, auth_caller: AuthHookCaller)
-        let ret = self
-            .invoke_component_method(auth_hook.component_address, &auth_hook.method, invoke_args![
-                action,
-                auth_caller
-            ])
-            .map_err(|e| match e {
-                RuntimeError::CrossTemplateCallMethodError { details, .. } => RuntimeError::AccessDeniedAuthHook {
-                    action_ident: action.into(),
-                    details: details.to_string(),
-                },
-                _ => e,
-            })?;
+        // The hook frame only accepts the `AuthHookCaller` argument if the resource it names is in the acting
+        // frame's scope. The reference is scoped to the hook call: the acting frame's scope must be the same after
+        // the hook as before it, whether or not the resource has a hook.
+        let resource_id: SubstateId = (*auth_caller.resource()).into();
+        let resource_was_in_scope = self.tracker.write_with(|state_mut| {
+            let scope = state_mut.current_call_scope_mut()?;
+            let was_in_scope = scope.is_substate_in_scope(&resource_id);
+            if !was_in_scope {
+                scope.add_substate_to_referenced(resource_id.clone());
+            }
+            Ok::<_, RuntimeError>(was_in_scope)
+        })?;
+
+        // The signature of a call back is (action: ResourceAuthAction, auth_caller: AuthHookCaller).
+        // The hook frame carries the acting component's caller badges, and the acting component never chose the hook
+        // code, so the frame is confined to its own component state: it cannot use those badges to act on any vault
+        // or resource, nor call out to a frame that could.
+        self.restricted_frame_pending = Some(FrameWriteMode::OwnComponent);
+        let ret = self.invoke_component_method(auth_hook.component_address, &auth_hook.method, invoke_args![
+            action,
+            auth_caller
+        ]);
+        self.restricted_frame_pending = None;
+        let ret = ret.map_err(|e| match e {
+            RuntimeError::CrossTemplateCallMethodError { details, .. } => RuntimeError::AccessDeniedAuthHook {
+                action_ident: action.into(),
+                details: details.to_string(),
+            },
+            _ => e,
+        })?;
         // Enforce that the return type is actually empty. We cannot rely on InstructionResult::return_type field
         // because that comes from the template definition which is defined by the template author and may not reflect
         // actual behaviour. `is_unit` accepts either `Value::Null` (ciborium/serde encoding of `()`) or
@@ -452,17 +494,22 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
         if !ret.indexed.value().is_unit() {
             return Err(RuntimeError::UnexpectedNonNullInAuthHookReturn);
         }
+
+        if !resource_was_in_scope {
+            self.tracker.write_with(|state_mut| {
+                state_mut
+                    .current_call_scope_mut()?
+                    .remove_substate_from_referenced(&resource_id);
+                Ok::<_, RuntimeError>(())
+            })?;
+        }
         Ok(())
     }
 
     fn get_call_runtime(&self) -> Runtime {
         // Load the runtime pointer that must be set by whoever initialized this interface
-        let ptr = self
-            .runtime_pointer
-            .as_ref()
-            .expect("BUG: Runtime pointer not set")
-            .load(atomic::Ordering::Acquire);
-        Runtime::from_pointer(ptr).expect("Runtime pointer is null")
+        let ptr = self.runtime_pointer.expect("BUG: Runtime pointer not set");
+        Runtime::from_pointer(ptr.as_ptr()).expect("Runtime pointer is null")
     }
 
     fn invoke_component_method(
@@ -509,11 +556,21 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
         })
     }
 
-    /// It is invalid to burn a bucket that has locked funds (e.g. by a proof). Burning downs only the unlocked
-    /// commitments, so a locked one would be left live with nothing referencing it.
-    fn check_bucket_is_burnable(bucket_id: BucketId, bucket: &Bucket) -> Result<(), RuntimeError> {
+    /// Takes a resource's write lock back after its auth hook has run. A hook must be able to read the resource it
+    /// guards, so the lock cannot be held across the call; the hook frame cannot write, so what it reads is what
+    /// the operation goes on to alter.
+    fn relock_resource_for_write(&mut self, resource_address: ResourceAddress) -> Result<LockedSubstate, RuntimeError> {
+        self.tracker
+            .write_with(|state_mut| state_mut.write_lock_substate(SubstateId::Resource(resource_address)))
+    }
+
+    /// A bucket with funds locked by a proof may only be held, never consumed. Every operation that empties one —
+    /// deposit, burn, join, fee payment — operates on the unlocked funds alone, so consuming a locked bucket would
+    /// destroy the locked portion while the proof still points at it.
+    fn check_bucket_is_unlocked(op: &'static str, bucket_id: BucketId, bucket: &Bucket) -> Result<(), RuntimeError> {
         if bucket.has_locked_funds() {
-            return Err(RuntimeError::InvalidOpDepositLockedBucket {
+            return Err(RuntimeError::InvalidOpLockedBucket {
+                op,
                 bucket_id,
                 locked_amount: bucket.locked_amount(),
             });
@@ -560,7 +617,9 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
         Ok(())
     }
 
-    fn check_resource_auth_hook(&mut self, hook: &AuthHook) -> Result<(), RuntimeError> {
+    /// Validates that `hook` names a method with an authorization hook's signature. `argument` names the engine
+    /// argument the hook arrived in, so that a rejection points at the call the caller actually made.
+    fn check_resource_auth_hook(&mut self, argument: &'static str, hook: &AuthHook) -> Result<(), RuntimeError> {
         let template_address = self
             .tracker
             .write_with(|state| state.get_template_for_component(hook.component_address))?;
@@ -568,26 +627,20 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
         let func = template
             .get_function(&hook.method)
             .ok_or(RuntimeError::InvalidArgument {
-                argument: "CreateResourceArg",
+                argument,
                 reason: format!("Authorize hook '{}' not found", hook),
             })?;
 
-        if func.is_mut {
-            return Err(RuntimeError::InvalidArgument {
-                argument: "CreateResourceArg",
-                reason: format!("Authorize hook '{}' cannot be mutable", hook),
-            });
-        }
         if !matches!(func.output, Type::Unit) {
             return Err(RuntimeError::InvalidArgument {
-                argument: "CreateResourceArg",
+                argument,
                 reason: format!("Authorize hook '{}' must return unit", hook),
             });
         }
 
         if func.arguments.len() != 3 {
             return Err(RuntimeError::InvalidArgument {
-                argument: "CreateResourceArg",
+                argument,
                 reason: format!(
                     "Authorize hook '{}' must take 3 arguments (incl &self), but found {}",
                     hook,
@@ -601,7 +654,7 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
             Some("ResourceAuthAction")
         ) {
             return Err(RuntimeError::InvalidArgument {
-                argument: "CreateResourceArg",
+                argument,
                 reason: format!("Authorize hook '{}' must take a ResourceAuthAction as argument 1", hook),
             });
         }
@@ -611,7 +664,7 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
             Some("AuthHookCaller")
         ) {
             return Err(RuntimeError::InvalidArgument {
-                argument: "CreateResourceArg",
+                argument,
                 reason: format!("Authorize hook '{}' must take an AuthHookCaller as argument 2", hook),
             });
         }
@@ -1047,10 +1100,10 @@ impl<TStore: StateReader + Clone + 'static, TTemplateProvider: TemplateProvider<
         // Make the introspection context reachable for the duration of the call (re-entered via the runtime pointer),
         // and restrict the predicate's frame to a read-only, non-cross-template sandbox.
         self.spend_exec_context = Some(exec);
-        self.restricted_frame_pending = true;
+        self.restricted_frame_pending = Some(FrameWriteMode::ReadOnly);
         let result = self.invoke_template_function(&tf.template, &tf.function, args);
         self.spend_exec_context = None;
-        self.restricted_frame_pending = false;
+        self.restricted_frame_pending = None;
 
         result
             .map(|_| ())
@@ -1063,7 +1116,7 @@ where
     TStore: StateReader + Clone + 'static,
     TTemplateProvider: TemplateProvider<Template = LoadedTemplate>,
 {
-    fn next_entity_id(&self) -> Result<EntityId, RuntimeError> {
+    fn next_entity_id(&mut self) -> Result<EntityId, RuntimeError> {
         let id = self.entity_id_provider.next_entity_id()?;
         Ok(id)
     }
@@ -1217,6 +1270,24 @@ where
                 let template_def = self.get_template_def(&template_addr)?;
                 validate_component_access_rule_methods(&access_rules, &template_def)?;
 
+                if access_rules.contains_scoped_to_component_or_template() {
+                    return Err(RuntimeError::InvalidArgument {
+                        argument: "access_rules",
+                        reason: "component(..)/template(..) cannot be used on a component method access rule"
+                            .to_string(),
+                    });
+                }
+                // A component owner rule is only ever evaluated with the component's own frame on top, so
+                // `component(..)`/`template(..)` would be constant (true for the component's own address).
+                if let OwnerRule::ByAccessRule(rule) = &owner_rule &&
+                    rule.contains_scoped_to_component_or_template()
+                {
+                    return Err(RuntimeError::InvalidArgument {
+                        argument: "owner_rule",
+                        reason: "component(..)/template(..) cannot be used in a component owner rule".to_string(),
+                    });
+                }
+
                 let owner_rule = match owner_rule {
                     OwnerRule::OwnedBySigner => SubstateOwnerRule::ByPublicKey(self.seal_signer_public_key),
                     OwnerRule::None => SubstateOwnerRule::None,
@@ -1325,6 +1396,14 @@ where
 
                 let access_rules: ComponentAccessRules = args.assert_one_arg()?;
 
+                if access_rules.contains_scoped_to_component_or_template() {
+                    return Err(RuntimeError::InvalidArgument {
+                        argument: "access_rules",
+                        reason: "component(..)/template(..) cannot be used on a component method access rule"
+                            .to_string(),
+                    });
+                }
+
                 self.tracker.write_with(|state| {
                     let component_lock = state
                         .current_call_scope()?
@@ -1390,11 +1469,13 @@ where
 
                 args.assert_no_args("Component::GetOwnerRule")?;
 
-                // The owner rule can never change so we'll just fetch the component
+                // The owner rule can never change, so this reads the component without locking it. It must read
+                // what the transaction has, not what the store had: a component created earlier in this same
+                // transaction is not in the store yet.
                 self.tracker.write_with(|state_mut| {
-                    let substate = state_mut.store().get_unmodified_substate(&component_address.into())?;
-                    let component = substate
-                        .substate_value()
+                    let component = state_mut
+                        .store()
+                        .get_latest_substate(&component_address.into())?
                         .component()
                         .ok_or(RuntimeError::InvariantError {
                             function: "GetOwnerProof",
@@ -1488,7 +1569,7 @@ where
 
                 // Check that auth hook is valid
                 if let Some(hook) = arg.authorize_hook.as_ref() {
-                    self.check_resource_auth_hook(hook)?;
+                    self.check_resource_auth_hook("CreateResourceArg", hook)?;
                 }
 
                 // Charge the initial mint's native verification cost against the payment-funded
@@ -1526,15 +1607,17 @@ where
                         None => state_mut.id_provider()?.new_resource_address()?,
                     };
 
-                    let mut payload = Metadata::from_iter([("resource_type", resource.resource_type().to_string())]);
-                    if let Some(symbol) = resource.metadata().get(TOKEN_SYMBOL) {
-                        payload.insert(TOKEN_SYMBOL, symbol);
-                    }
-                    if let Some(image_url) = resource.metadata().get(IMAGE_URL) {
-                        payload.insert(IMAGE_URL, image_url);
+                    // The system's resource addresses must stay under the system's control: the genesis resources
+                    // are created once, and the two caller-badge resources must stay empty for the engine's badges
+                    // to be unforgeable.
+                    if resource_address.is_system_reserved() {
+                        return Err(RuntimeError::InvalidArgument {
+                            argument: "resource_address",
+                            reason: format!("Resource address {resource_address} is reserved by the system"),
+                        });
                     }
 
-                    Self::emit_std_event("resource", "create", resource_address, payload, state_mut)?;
+                    Self::emit_std_event("resource", "create", resource_address, Metadata::new(), state_mut)?;
 
                     state_mut.new_substate(resource_address, resource)?;
                     let resource_lock = state_mut.write_lock_substate(SubstateId::Resource(resource_address))?;
@@ -1603,7 +1686,7 @@ where
                         })?;
                 let mint_resource: MintResourceArg = args.assert_one_arg()?;
 
-                let (resource_lock, maybe_auth_hook, auth_caller, has_view_key, tracks_supply) =
+                let (maybe_auth_hook, auth_caller, has_view_key, tracks_supply) =
                     self.tracker.write_with(|state_mut| {
                         let resource_lock = state_mut.write_lock_substate(SubstateId::Resource(resource_address))?;
 
@@ -1615,21 +1698,19 @@ where
                             resource.access_rules(),
                         )?;
 
-                        let auth_caller = state_mut.get_auth_caller()?;
+                        let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
                         let has_view_key = resource.view_key().is_some();
                         let tracks_supply = resource.is_supply_tracking_enabled();
-                        Ok::<_, RuntimeError>((
-                            resource_lock,
-                            resource.auth_hook().cloned(),
-                            auth_caller,
-                            has_view_key,
-                            tracks_supply,
-                        ))
+                        let auth_hook = resource.auth_hook().cloned();
+                        state_mut.unlock_substate(resource_lock)?;
+                        Ok::<_, RuntimeError>((auth_hook, auth_caller, has_view_key, tracks_supply))
                     })?;
 
                 if let Some(auth_hook) = maybe_auth_hook {
                     self.invoke_resource_access_hook(auth_hook, auth_caller, ResourceAuthAction::Mint)?;
                 }
+
+                let resource_lock = self.relock_resource_for_write(resource_address)?;
 
                 // Charge the mint's native verification cost against the payment-funded allowance
                 // before its proof crypto runs.
@@ -1641,10 +1722,7 @@ where
                     let resource = state_mut.mint_resource(&resource_lock, mint_arg)?;
                     let bucket_id = state_mut.id_provider()?.new_bucket_id();
 
-                    let payload = Metadata::from_iter([
-                        ("resource_type", resource.resource_type().to_string()),
-                        ("amount", resource.unlocked_amount().to_string()),
-                    ]);
+                    let payload = Metadata::from_iter([("amount", resource.unlocked_amount().to_string())]);
                     Self::emit_std_event("resource", "mint", resource_address, payload, state_mut)?;
 
                     state_mut.new_bucket(bucket_id, resource)?;
@@ -1676,7 +1754,7 @@ where
                     )?;
 
                     let auth_hook = resource.auth_hook().cloned();
-                    let auth_caller = state_mut.get_auth_caller()?;
+                    let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
 
                     state_mut.unlock_substate(resource_lock)?;
                     Ok::<_, RuntimeError>((auth_hook, auth_caller))
@@ -1689,10 +1767,20 @@ where
                 self.tracker.write_with(|state_mut| {
                     let vault_lock = state_mut.write_lock_substate(arg.vault_id.into())?;
 
+                    // The recall rule that authorized this action belongs to `resource_address`, so it may only
+                    // reach vaults holding that resource.
+                    let vault_resource = *state_mut.get_vault(&vault_lock)?.resource_address();
+                    if vault_resource != resource_address {
+                        return Err(RuntimeError::RecallResourceMismatch {
+                            vault_id: arg.vault_id,
+                            resource_address,
+                            vault_resource,
+                        });
+                    }
+
                     let resource = state_mut.recall_resource_from_vault(&vault_lock, &arg.resource)?;
 
                     let payload = Metadata::from_iter([
-                        ("resource_type", resource.resource_type().to_string()),
                         ("vault_id", arg.vault_id.to_string()),
                         ("recall_desc", arg.resource.to_string()),
                     ]);
@@ -1760,7 +1848,7 @@ where
                     )?;
 
                     let auth_hook = resource.auth_hook().cloned();
-                    let auth_caller = state_mut.get_auth_caller()?;
+                    let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
 
                     state_mut.unlock_substate(resource_lock)?;
                     Ok::<_, RuntimeError>((auth_hook, auth_caller))
@@ -1789,12 +1877,11 @@ where
                         })?;
                     contents.set_mutable_data(arg.data);
 
-                    let payload = Metadata::from_iter([("resource_type", ResourceType::NonFungible.to_string())]);
                     Self::emit_std_event(
                         "resource",
                         "update_nonfungible_data",
                         resource_address,
-                        payload,
+                        Metadata::new(),
                         state_mut,
                     )?;
 
@@ -1837,11 +1924,61 @@ where
                 self.tracker.write_with(|state_mut| {
                     let resource_mut = state_mut.get_resource_mut(&resource_lock)?;
                     resource_mut.update_access_rule(action, new_rule);
-                    let payload = Metadata::from_iter([
-                        ("resource_type", resource_mut.resource_type().to_string()),
-                        ("action", format!("{:?}", action)),
-                    ]);
+                    let payload = Metadata::from_iter([("action", format!("{:?}", action))]);
                     Self::emit_std_event("resource", "update_access_rule", resource_address, payload, state_mut)?;
+
+                    state_mut.unlock_substate(resource_lock)?;
+
+                    Ok(InvokeResult::unit())
+                })
+            },
+            ResourceAction::UpdateAuthHook => {
+                let resource_address =
+                    resource_ref
+                        .as_resource_address()
+                        .ok_or_else(|| RuntimeError::InvalidArgument {
+                            argument: "resource_ref",
+                            reason: "UpdateAuthHook resource action requires a resource address".to_string(),
+                        })?;
+                let UpdateAuthHookArg { auth_hook } = args.assert_one_arg()?;
+
+                let resource_lock = self.tracker.write_with(|state_mut| {
+                    let resource_lock = state_mut.write_lock_substate(SubstateId::Resource(resource_address))?;
+
+                    let resource = state_mut.get_resource(&resource_lock)?;
+                    let updater = resource.access_rules().auth_hook_updater();
+
+                    let authorized = match updater {
+                        UpdateRule::Locked => false,
+                        UpdateRule::Owner => state_mut.authorization().check_ownership(resource.as_ownership())?,
+                        UpdateRule::AccessRule(rule) => state_mut.authorization().check_access_rule(rule)?,
+                    };
+
+                    if !authorized {
+                        return Err(RuntimeError::AccessDenied {
+                            action_ident: ActionIdent::Native(NativeAction::UpdateResourceAuthHook),
+                        });
+                    }
+
+                    Ok::<_, RuntimeError>(resource_lock)
+                })?;
+
+                // The hook being replaced is not invoked: a hook that denies or panics is the failure this
+                // action exists to repair, so asking it to approve its own removal would defeat the point.
+                if let Some(hook) = auth_hook.as_ref() {
+                    self.check_resource_auth_hook("UpdateAuthHookArg", hook)?;
+                }
+
+                self.tracker.write_with(|state_mut| {
+                    let resource_mut = state_mut.get_resource_mut(&resource_lock)?;
+                    // An absent key says the hook was removed, so a reader sees the removal without
+                    // fetching the resource.
+                    let mut payload = Metadata::new();
+                    if let Some(hook) = auth_hook.as_ref() {
+                        payload.insert("auth_hook", hook.to_string());
+                    }
+                    resource_mut.set_auth_hook(auth_hook);
+                    Self::emit_std_event("resource", "update_auth_hook", resource_address, payload, state_mut)?;
 
                     state_mut.unlock_substate(resource_lock)?;
 
@@ -1860,7 +1997,7 @@ where
 
                 Self::check_token_symbol_length(&new_metadata)?;
 
-                let (resource_lock, maybe_auth_hook, auth_caller) = self.tracker.write_with(|state_mut| {
+                let (maybe_auth_hook, auth_caller) = self.tracker.write_with(|state_mut| {
                     let resource_lock = state_mut.write_lock_substate(SubstateId::Resource(resource_address))?;
 
                     let resource = state_mut.get_resource(&resource_lock)?;
@@ -1881,23 +2018,28 @@ where
                         });
                     }
 
-                    let auth_caller = state_mut.get_auth_caller()?;
-                    Ok::<_, RuntimeError>((resource_lock, resource.auth_hook().cloned(), auth_caller))
+                    let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
+                    let auth_hook = resource.auth_hook().cloned();
+                    state_mut.unlock_substate(resource_lock)?;
+                    Ok::<_, RuntimeError>((auth_hook, auth_caller))
                 })?;
 
                 if let Some(auth_hook) = maybe_auth_hook {
                     self.invoke_resource_access_hook(auth_hook, auth_caller, ResourceAuthAction::UpdateMetadata)?;
                 }
 
+                let resource_lock = self.relock_resource_for_write(resource_address)?;
+
                 self.tracker.write_with(|state_mut| {
                     let resource_mut = state_mut.get_resource_mut(&resource_lock)?;
                     resource_mut.set_metadata(new_metadata);
-                    let mut payload =
-                        Metadata::from_iter([("resource_type", resource_mut.resource_type().to_string())]);
-                    if let Some(symbol) = resource_mut.token_symbol() {
-                        payload.insert(TOKEN_SYMBOL, symbol);
-                    }
-                    Self::emit_std_event("resource", "update_metadata", resource_address, payload, state_mut)?;
+                    Self::emit_std_event(
+                        "resource",
+                        "update_metadata",
+                        resource_address,
+                        Metadata::new(),
+                        state_mut,
+                    )?;
 
                     state_mut.unlock_substate(resource_lock)?;
 
@@ -1933,7 +2075,7 @@ where
                     )?;
 
                     let auth_hook = resource.auth_hook().cloned();
-                    let auth_caller = state_mut.get_auth_caller()?;
+                    let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
 
                     state_mut.unlock_substate(resource_lock)?;
                     Ok::<_, RuntimeError>((auth_hook, auth_caller))
@@ -1945,6 +2087,18 @@ where
 
                 self.tracker.write_with(|state_mut| {
                     let vault_lock = state_mut.write_lock_substate(arg.vault_id.into())?;
+
+                    // The freeze rule that authorized this action belongs to `resource_address`, so it may only
+                    // reach vaults holding that resource.
+                    let vault_resource = *state_mut.get_vault(&vault_lock)?.resource_address();
+                    if vault_resource != resource_address {
+                        return Err(RuntimeError::FreezeResourceMismatch {
+                            vault_id: arg.vault_id,
+                            resource_address,
+                            vault_resource,
+                        });
+                    }
+
                     state_mut.set_vault_freeze(&vault_lock, arg.flags)?;
                     let payload =
                         Metadata::from_iter([("vault_id", arg.vault_id.to_string()), ("flags", arg.flags.to_string())]);
@@ -2315,7 +2469,7 @@ where
                             resource.access_rules(),
                         )?;
 
-                        let auth_caller = state_mut.get_auth_caller()?;
+                        let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
                         Ok::<_, RuntimeError>((vault_lock, resource_lock, resource.auth_hook().cloned(), auth_caller))
                     })?;
 
@@ -2325,20 +2479,10 @@ where
 
                 self.tracker.write_with(move |state_mut| {
                     let bucket = state_mut.take_bucket(bucket_id)?;
-                    // It is invalid to deposit a bucket that has locked funds
-                    if bucket.has_locked_funds() {
-                        return Err(RuntimeError::InvalidOpDepositLockedBucket {
-                            bucket_id,
-                            locked_amount: bucket.locked_amount(),
-                        });
-                    }
+                    Self::check_bucket_is_unlocked("deposit", bucket_id, &bucket)?;
 
                     // Emit a builtin event for the deposit
-                    let payload = Metadata::from_iter([
-                        ("resource_address", bucket.resource_address().to_string()),
-                        ("resource_type", bucket.resource_type().to_string()),
-                        ("amount", bucket.unlocked_amount().to_string()),
-                    ]);
+                    let payload = Metadata::from_iter([("amount", bucket.unlocked_amount().to_string())]);
 
                     Self::emit_std_event("vault", "deposit", vault_id, payload, state_mut)?;
 
@@ -2382,7 +2526,7 @@ where
                             resource.access_rules(),
                         )?;
 
-                        let auth_caller = state_mut.get_auth_caller()?;
+                        let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
                         let has_view_key = resource.view_key().is_some();
                         Ok::<_, RuntimeError>((
                             vault_lock,
@@ -2452,11 +2596,7 @@ where
                     }
 
                     // Emit a builtin event for the withdraw
-                    let payload = Metadata::from_iter([
-                        ("resource_address", resource_container.resource_address().to_string()),
-                        ("resource_type", resource_container.resource_type().to_string()),
-                        ("amount", public_amount.to_string()),
-                    ]);
+                    let payload = Metadata::from_iter([("amount", public_amount.to_string())]);
 
                     Self::emit_std_event("vault", "withdraw", vault_id, payload, state)?;
 
@@ -2669,7 +2809,7 @@ where
                             resource.access_rules(),
                         )?;
 
-                        let auth_caller = state_mut.get_auth_caller()?;
+                        let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
                         Ok::<_, RuntimeError>((vault_lock, resource_lock, resource.auth_hook().cloned(), auth_caller))
                     })?;
 
@@ -2719,7 +2859,7 @@ where
                             resource.access_rules(),
                         )?;
 
-                        let auth_caller = state_mut.get_auth_caller()?;
+                        let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
                         Ok::<_, RuntimeError>((vault_lock, resource_lock, resource.auth_hook().cloned(), auth_caller))
                     })?;
 
@@ -2769,7 +2909,7 @@ where
                             resource.access_rules(),
                         )?;
 
-                        let auth_caller = state_mut.get_auth_caller()?;
+                        let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
                         Ok::<_, RuntimeError>((vault_lock, resource_lock, resource.auth_hook().cloned(), auth_caller))
                     })?;
 
@@ -2963,6 +3103,7 @@ where
 
                 self.tracker.write_with(|state| {
                     let other_bucket = state.take_bucket(other_bucket_id)?;
+                    Self::check_bucket_is_unlocked("join", other_bucket_id, &other_bucket)?;
                     let bucket = state.get_bucket_mut(bucket_id)?;
                     bucket.join(other_bucket)?;
                     Ok(InvokeResult::encode(&bucket_id)?)
@@ -2976,15 +3117,15 @@ where
 
                 let arg: BurnBucketArg = args.assert_one_arg()?;
 
-                let (resource_lock, maybe_auth_hook, auth_caller, tracks_supply) =
+                let (resource_address, maybe_auth_hook, auth_caller, tracks_supply) =
                     self.tracker.write_with(|state_mut| {
                         let bucket = state_mut.get_bucket(bucket_id)?;
                         // Reject a burn that cannot succeed before the auth hook runs or anything is charged for it.
                         // This is re-checked after the hook, which may lock funds itself.
-                        Self::check_bucket_is_burnable(bucket_id, bucket)?;
+                        Self::check_bucket_is_unlocked("burn", bucket_id, bucket)?;
 
-                        let resource_lock =
-                            state_mut.write_lock_substate(SubstateId::Resource(*bucket.resource_address()))?;
+                        let resource_address = *bucket.resource_address();
+                        let resource_lock = state_mut.write_lock_substate(SubstateId::Resource(resource_address))?;
 
                         let resource = state_mut.get_resource(&resource_lock)?;
 
@@ -2994,25 +3135,25 @@ where
                             resource.access_rules(),
                         )?;
 
-                        let auth_caller = state_mut.get_auth_caller()?;
-                        Ok::<_, RuntimeError>((
-                            resource_lock,
-                            resource.auth_hook().cloned(),
-                            auth_caller,
-                            resource.is_supply_tracking_enabled(),
-                        ))
+                        let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
+                        let auth_hook = resource.auth_hook().cloned();
+                        let tracks_supply = resource.is_supply_tracking_enabled();
+                        state_mut.unlock_substate(resource_lock)?;
+                        Ok::<_, RuntimeError>((resource_address, auth_hook, auth_caller, tracks_supply))
                     })?;
 
                 if let Some(auth_hook) = maybe_auth_hook {
                     self.invoke_resource_access_hook(auth_hook, auth_caller, ResourceAuthAction::Burn)?;
                 }
 
+                let resource_lock = self.relock_resource_for_write(resource_address)?;
+
                 // The hook may have altered the bucket, so it is re-inspected after the hook runs and before
                 // anything is charged: a hook that locked funds makes the burn fail, and the charge must cover the
                 // proofs actually verified below rather than those held when the hook was scheduled.
                 let value_proof_points = self.tracker.write_with(|state_mut| {
                     let bucket = state_mut.get_bucket(bucket_id)?;
-                    Self::check_bucket_is_burnable(bucket_id, bucket)?;
+                    Self::check_bucket_is_unlocked("burn", bucket_id, bucket)?;
                     if !tracks_supply {
                         return Ok::<_, RuntimeError>(0);
                     }
@@ -3065,7 +3206,7 @@ where
                     )?;
 
                     let auth_hook = resource.auth_hook().cloned();
-                    let auth_caller = state_mut.get_auth_caller()?;
+                    let auth_caller = state_mut.get_auth_caller(&resource_lock)?;
 
                     state_mut.unlock_substate(resource_lock)?;
                     Ok::<_, RuntimeError>((auth_hook, auth_caller))
@@ -3173,7 +3314,7 @@ where
                 })?;
                 args.assert_no_args("Proof.GetAmount")?;
                 self.tracker.write_with(|state| {
-                    let proof = state.get_proof(proof_id)?;
+                    let proof = state.get_proof_in_scope(proof_id)?;
                     Ok(InvokeResult::encode(&proof.amount())?)
                 })
             },
@@ -3184,7 +3325,7 @@ where
                 })?;
                 args.assert_no_args("Proof.GetResourceAddress")?;
                 self.tracker.write_with(|state| {
-                    let proof = state.get_proof(proof_id)?;
+                    let proof = state.get_proof_in_scope(proof_id)?;
                     Ok(InvokeResult::encode(proof.resource_address())?)
                 })
             },
@@ -3197,7 +3338,7 @@ where
                 args.assert_no_args("Proof.GetResourceType")?;
 
                 self.tracker.write_with(|state| {
-                    let proof = state.get_proof(proof_id)?;
+                    let proof = state.get_proof_in_scope(proof_id)?;
                     Ok(InvokeResult::encode(&proof.resource_type())?)
                 })
             },
@@ -3210,7 +3351,7 @@ where
                 args.assert_no_args("Proof.GetNonFungibles")?;
 
                 self.tracker.write_with(|state| {
-                    let proof = state.get_proof(proof_id)?;
+                    let proof = state.get_proof_in_scope(proof_id)?;
                     let nfts = proof.non_fungible_token_ids();
                     Ok(InvokeResult::encode(&nfts)?)
                 })
@@ -3223,7 +3364,10 @@ where
                 args.assert_no_args("Proof.CreateAccess")?;
 
                 self.tracker.write_with(|state| {
-                    if !state.proof_exists(proof_id) {
+                    // A proof id is a sequential counter shared by the whole transaction, so authority has to come
+                    // from the frame's own scope: a proof it created, was passed as an argument, or a callee handed
+                    // back. Every other live proof in the transaction belongs to someone else.
+                    if !state.proof_exists(proof_id) || !state.current_call_scope()?.is_proof_in_scope(&proof_id) {
                         return Ok(InvokeResult::encode(&Err::<(), _>(NotAuthorized))?);
                     }
                     state.current_call_scope_mut()?.auth_scope_mut().add_proof(proof_id);
@@ -3238,9 +3382,13 @@ where
                 args.assert_no_args("Proof.DropAuthorize")?;
 
                 self.tracker.write_with(|state| {
-                    if !state.proof_exists(proof_id) {
-                        return Err(RuntimeError::ProofNotFound { proof_id });
-                    }
+                    // Giving up an authorization only shrinks this frame's own auth scope, so it succeeds for any
+                    // id: an id the frame never authorized is already in the state being asked for. That makes it
+                    // answerless by construction, which is what keeps it from reporting whether a proof is live at
+                    // an id the frame does not hold — the ids are a dense counter, so an answer would enumerate
+                    // every proof in the transaction. `ProofAccess::drop` is the only route here, and a `Drop` has
+                    // nowhere to report a failure, so a rejection would abort the transaction from a drop point
+                    // the template author never wrote.
                     state.current_call_scope_mut()?.auth_scope_mut().remove_proof(&proof_id);
 
                     Ok(InvokeResult::unit())
@@ -3293,15 +3441,13 @@ where
                                 id,
                                 existing_ids: state.workspace().all_ids_iter().collect(),
                             })?;
-                    Ok(InvokeResult::from_value(value))
+                    Ok(InvokeResult::from_value(value)?)
                 })
             },
 
             WorkspaceAction::DropAllProofs => {
                 args.assert_no_args("WorkspaceAction::DropAllProofs")?;
-                let proofs = self
-                    .tracker
-                    .with_workspace_mut(|workspace| workspace.drain_all_proofs());
+                let proofs = self.tracker.with_workspace_mut(|workspace| workspace.take_all_proofs());
 
                 self.tracker.write_with(|state| {
                     for proof_id in proofs {
@@ -3324,7 +3470,7 @@ where
                 args.assert_no_args("WorkspaceAction::DropAll")?;
                 let proofs = self.tracker.with_workspace_mut(|workspace| {
                     workspace.clear_items();
-                    workspace.drain_all_proofs()
+                    workspace.take_all_proofs()
                 });
 
                 self.tracker.write_with(|state| {
@@ -3367,7 +3513,7 @@ where
                         .data()
                         .clone();
                     state.unlock_substate(nft_lock)?;
-                    Ok(InvokeResult::from_value(contents))
+                    Ok(InvokeResult::from_value(contents)?)
                 })
             },
             NonFungibleAction::GetMutableData => {
@@ -3387,7 +3533,7 @@ where
                         .clone();
                     state.unlock_substate(nft_lock)?;
 
-                    Ok(InvokeResult::from_value(contents))
+                    Ok(InvokeResult::from_value(contents)?)
                 })
             },
         }
@@ -3423,10 +3569,9 @@ where
 
     fn generate_uuid(&mut self) -> Result<[u8; 32], RuntimeError> {
         self.invoke_modules_on_runtime_call("generate_uuid")?;
-        self.tracker.read_with(|state| {
+        self.tracker.write_with(|state| {
             let epoch_hash = state.get_current_epoch_hash()?;
-            let id_provider = state.id_provider()?;
-            Ok(id_provider.new_uuid(&epoch_hash)?)
+            Ok(state.id_provider()?.new_uuid(&epoch_hash)?)
         })
     }
 
@@ -3516,11 +3661,7 @@ where
         // payment that cannot cover it cannot commit anything at all — better established here,
         // before the main instructions run, than after they have consumed compute nobody pays for.
         self.invoke_modules_on_fee_checkpoint()?;
-        // Against what the payment can spend on charges, not against the payment itself: the burn is
-        // taken over whatever the charges come to, so a payment that exactly matches them cannot
-        // also cover the burn on top.
-        if !self.tracker.is_fee_state_dry_run() &&
-            self.tracker.spendable_fee_payments() < self.tracker.total_fee_charges()
+        if !self.tracker.is_fee_state_dry_run() && self.tracker.total_fee_payments() < self.tracker.total_fee_charges()
         {
             return Err(RuntimeError::InsufficientFeesPaid {
                 required_fee: self.tracker.required_fee_payment(),
@@ -3618,11 +3759,11 @@ where
                         })
                         .transpose()?;
 
-                    let template = state.current_template()?;
-                    let id_provider = state.id_provider()?;
+                    let template = *state.current_template()?;
+                    let mut id_provider = state.id_provider()?;
                     let address = public_key
                         .as_ref()
-                        .map(|public_key| id_provider.derive_new_component_address(template, public_key))
+                        .map(|public_key| id_provider.derive_new_component_address(&template, public_key))
                         .unwrap_or_else(|| id_provider.new_component_address())?;
 
                     let id = state.new_address_allocation(address)?;
@@ -3679,7 +3820,7 @@ where
             },
         };
 
-        Ok(InvokeResult::from_value(exec_result.indexed.into_value()))
+        Ok(InvokeResult::from_value(exec_result.indexed.into_value())?)
     }
 
     fn builtin_template_invoke(&mut self, action: BuiltinTemplateAction) -> Result<InvokeResult, RuntimeError> {
@@ -3698,6 +3839,20 @@ where
     fn check_component_access_rules(&self, method: &str) -> Result<(), RuntimeError> {
         self.tracker
             .read_with(|state| state.authorization().check_current_component_access_rules(method))
+    }
+
+    fn check_signer_badge_in_scope(&self, public_key: RistrettoPublicKeyBytes) -> Result<(), RuntimeError> {
+        self.tracker.read_with(|state| {
+            let badge = NonFungibleAddress::from_public_key(public_key);
+            if !state.base_call_scope().auth_scope().contains_badge(&badge) {
+                return Err(RuntimeError::SignerBadgeNotInScope { public_key });
+            }
+            Ok(())
+        })
+    }
+
+    fn revoke_boundary_proofs(&mut self) -> Result<(), RuntimeError> {
+        self.tracker.write_with(|state| state.revoke_boundary_proofs())
     }
 
     fn check_component_ownership(&self, action: ActionIdent) -> Result<(), RuntimeError> {
@@ -3750,12 +3905,11 @@ where
 
     fn push_call_frame(&mut self, frame: PushCallFrame) -> Result<(), RuntimeError> {
         self.tracker.push_call_frame(frame)?;
-        // A spend-script predicate is invoked via the generic `call_function` path, so we restrict the frame it just
-        // pushed here rather than threading a flag through that path. The predicate's WASM only runs after this
-        // returns, so the read-only/no-cross-template restriction is in place before any host op can be issued.
-        if self.restricted_frame_pending {
-            self.restricted_frame_pending = false;
-            self.tracker.write_with(|state| state.make_current_frame_read_only())?;
+        // Spend-script predicates and auth hooks are invoked via the generic `call_function` / `call_method` paths,
+        // so we restrict the frame they just pushed here rather than threading a flag through those paths. The WASM
+        // only runs after this returns, so the restriction is in place before any host op can be issued.
+        if let Some(mode) = self.restricted_frame_pending.take() {
+            self.tracker.write_with(|state| state.restrict_current_frame(mode))?;
         }
         Ok(())
     }
@@ -3826,24 +3980,15 @@ where
         Ok(())
     }
 
-    fn signature_invoke(&mut self, action: SignatureAction, args: EngineArgs) -> Result<InvokeResult, RuntimeError> {
-        self.invoke_modules_on_runtime_call("signature_invoke")?;
+    fn intrinsic_invoke(&mut self, intrinsic: IntrinsicId, args: EngineArgs) -> Result<InvokeResult, RuntimeError> {
+        self.invoke_modules_on_runtime_call("intrinsic_invoke")?;
 
-        match action {
-            SignatureAction::Verify => {
-                self.invoke_modules_on_runtime_event(RuntimeEvent::SignatureVerified)?;
+        // Priced from the declared arguments and charged before the work runs, so a transaction that
+        // cannot afford an intrinsic traps without the validator having performed it.
+        let points = intrinsics::price(intrinsic, &args)?;
+        self.tracker.charge_native_execution(points)?;
 
-                let SignatureVerifyArg {
-                    public_key,
-                    domain,
-                    message,
-                    payload,
-                } = args.assert_one_arg()?;
-
-                let is_valid = payload.get_verifier().verify(&domain, &message, &public_key, &payload);
-                Ok(InvokeResult::encode(&is_valid)?)
-            },
-        }
+        intrinsics::dispatch(intrinsic, args)
     }
 
     fn spend_context_invoke(&mut self, action: SpendContextAction) -> Result<InvokeResult, RuntimeError> {
@@ -3880,29 +4025,25 @@ where
         entity_id: EntityId,
         workspace_id: WorkspaceId,
     ) -> Result<AllocateAddressResult, RuntimeError> {
-        self.tracker.write_with(|state| {
-            let id_provider = state.id_provider_for_entity(entity_id);
-
-            match substate_type {
-                AllocatableAddressType::Component => {
-                    let address = id_provider.new_component_address()?;
-                    let id = state.new_address_allocation(address)?;
-                    let value = IndexedValue::from_type(&ComponentAddressAllocation::new(id))?;
-                    state.workspace_mut().insert(workspace_id, value)?;
-                    Ok(AllocateAddressResult::ComponentAddress(
-                        ComponentAddressAllocation::new(id),
-                    ))
-                },
-                AllocatableAddressType::Resource => {
-                    let address = id_provider.new_resource_address()?;
-                    let id = state.new_address_allocation(address)?;
-                    let value = IndexedValue::from_type(&ResourceAddressAllocation::new(id))?;
-                    state.workspace_mut().insert(workspace_id, value)?;
-                    Ok(AllocateAddressResult::ResourceAddress(ResourceAddressAllocation::new(
-                        id,
-                    )))
-                },
-            }
+        self.tracker.write_with(|state| match substate_type {
+            AllocatableAddressType::Component => {
+                let address = state.id_provider_for_entity(entity_id).new_component_address()?;
+                let id = state.new_address_allocation(address)?;
+                let value = IndexedValue::from_type(&ComponentAddressAllocation::new(id))?;
+                state.workspace_mut().insert(workspace_id, value)?;
+                Ok(AllocateAddressResult::ComponentAddress(
+                    ComponentAddressAllocation::new(id),
+                ))
+            },
+            AllocatableAddressType::Resource => {
+                let address = state.id_provider_for_entity(entity_id).new_resource_address()?;
+                let id = state.new_address_allocation(address)?;
+                let value = IndexedValue::from_type(&ResourceAddressAllocation::new(id))?;
+                state.workspace_mut().insert(workspace_id, value)?;
+                Ok(AllocateAddressResult::ResourceAddress(ResourceAddressAllocation::new(
+                    id,
+                )))
+            },
         })
     }
 
@@ -3982,6 +4123,7 @@ where
                             reason: format!("PayFee::FromBucket: Expected workspace ID to contain a BucketId: {e}"),
                         })?;
                     let bucket = state_mut.take_bucket(input_bucket)?;
+                    Self::check_bucket_is_unlocked("pay a fee from", input_bucket, &bucket)?;
 
                     // No refunds
                     state_mut.pay_fee(bucket.take_all(), None)?;
@@ -4018,6 +4160,16 @@ where
             module.on_wasm_execution(&mut self.tracker, points_consumed)?;
         }
         Ok(())
+    }
+
+    fn charge_template_instantiation(&mut self, shape: &ModuleShape) -> Result<(), RuntimeError> {
+        self.tracker
+            .charge_native_execution(tari_engine_types::limits::instantiation_points(shape))
+    }
+
+    fn charge_template_compile(&mut self, binary_bytes: u64) -> Result<(), RuntimeError> {
+        self.tracker
+            .charge_native_execution(tari_engine_types::limits::template_compile_points(binary_bytes))
     }
 
     fn wasm_points_consumed(&self) -> u64 {
@@ -4083,7 +4235,7 @@ where
     }
 
     fn set_runtime_pointer(&mut self, pointer: *mut Box<dyn RuntimeInterface>) {
-        self.runtime_pointer = Some(AtomicPtr::new(pointer));
+        self.runtime_pointer = NonNull::new(pointer);
     }
 }
 

@@ -89,7 +89,6 @@ use tari_ootle_storage::{
 };
 use tari_ootle_transaction::TransactionId;
 use tari_state_tree::{Child, Nibble, Node, NodeKey, NodeType, StaleTreeNode, StateTreePayload, Version};
-use tari_template_lib_types::crypto::RistrettoPublicKeyBytes;
 
 use crate::{
     cf_api::{CfContext, DbContext},
@@ -120,8 +119,6 @@ use crate::{
         chain::PendingChainIndex,
         diagnostic_no_vote::{DiagnosticsNoVoteCf, DiagnosticsNoVoteData},
         epoch_checkpoint::EpochCheckpointCf,
-        evicted_node,
-        evicted_node::{EvictedNodeCf, EvictedNodeData},
         finalized_transaction,
         finalized_transaction::{FinalizedTransactionLinkCf, FinalizedTransactionLinkData},
         foreign_parked_blocks,
@@ -670,8 +667,6 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
 
         let finalized_cf = self.db().cf(FinalizedTransactionLinkCf)?;
         let epoch_index_cf = self.db().cf(finalized_transaction::EpochIndex)?;
-        let exec_query = self.db().cf(block_transaction_execution::ByTransactionIdQuery)?;
-        let exec_index_cf = self.db().cf(block_transaction_execution::BlockIndex)?;
 
         let iter = transactions.into_iter();
         // Add transactions to finalized CF
@@ -690,13 +685,6 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
             }
             finalized_cf.put(transaction.id(), &data, OPERATION)?;
             epoch_index_cf.put(&(epoch, *transaction.id()), &(), OPERATION)?;
-
-            // Delete from block index which is used for querying pending executions
-            let iter = exec_query.query_prefix_range_key_iterator(Ordering::default(), transaction.id());
-            for result in iter {
-                let (tx_id, block_id, height) = result?;
-                exec_index_cf.delete(&(block_id, tx_id, height), OPERATION)?;
-            }
         }
 
         Ok(())
@@ -723,8 +711,6 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
         for result in iter {
             let (tx_id, block_id, height) = result?;
             exec_cf.delete(&(tx_id, block_id, height), OPERATION)?;
-            // The block index entry is removed at finalize, but executions recorded by proposals
-            // still in flight at that point may have index entries remaining.
             exec_index_cf.delete(&(block_id, tx_id, height), OPERATION)?;
         }
 
@@ -1729,60 +1715,6 @@ impl<'tx, TAddr: NodeAddressable + 'tx> StateStoreWriteTransaction for RocksDbSt
                     cf.put(&(epoch, *update.public_key()), &rec, OPERATION)?;
                 },
             }
-        }
-
-        Ok(())
-    }
-
-    fn evicted_nodes_evict(
-        &mut self,
-        public_key: &RistrettoPublicKeyBytes,
-        evicted_in_block: BlockId,
-    ) -> Result<(), StorageError> {
-        const OPERATION: &str = "evicted_nodes_evict";
-
-        let block = self
-            .blocks_get(&evicted_in_block)
-            .optional()?
-            .ok_or_else(|| StorageError::DataInconsistency {
-                details: format!("{OPERATION}: block {evicted_in_block} does not exist"),
-            })?;
-
-        self.db().cf(EvictedNodeCf)?.put(
-            &(*public_key, evicted_in_block),
-            &EvictedNodeData {
-                is_committed: false,
-                epoch: block.epoch(),
-            },
-            OPERATION,
-        )?;
-
-        Ok(())
-    }
-
-    fn evicted_nodes_mark_eviction_as_committed(
-        &mut self,
-        public_key: &RistrettoPublicKeyBytes,
-        // For debugging
-        _epoch: Epoch,
-    ) -> Result<(), StorageError> {
-        const OPERATION: &str = "evicted_nodes_mark_eviction_as_committed";
-
-        let cf = self.db().cf(EvictedNodeCf)?;
-        let query = self.db().cf(evicted_node::ByPublicKeyQuery)?;
-
-        let iter = query.query_prefix_range_iterator(Ordering::Ascending, public_key);
-
-        for result in iter {
-            let (key, value) = result?;
-            cf.put(
-                &key,
-                &EvictedNodeData {
-                    is_committed: true,
-                    epoch: value.epoch,
-                },
-                OPERATION,
-            )?;
         }
 
         Ok(())

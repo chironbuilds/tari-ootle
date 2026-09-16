@@ -15,11 +15,13 @@ use tari_template_lib::{
 use tari_template_test_tooling::{TemplateTest, support::assert_error::assert_reject_reason};
 
 const CRATE_PATH: &str = env!("CARGO_MANIFEST_DIR");
+const TEMPLATE_PATHS: &[&str] = &["tests/templates/shenanigans"];
+const RESOURCE_TEMPLATE_PATHS: &[&str] = &["tests/templates/resource_shenanigans"];
 const TEMPLATE_NAME: &str = "Shenanigans";
 
 #[test]
 fn it_rejects_dangling_vaults_in_constructor() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
 
     let reason = test.execute_expect_failure(
@@ -38,7 +40,7 @@ fn it_rejects_dangling_vaults_in_constructor() {
 
 #[test]
 fn it_rejects_dangling_vault_that_has_been_returned() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
 
     let reason = test.execute_expect_failure(
@@ -53,7 +55,7 @@ fn it_rejects_dangling_vault_that_has_been_returned() {
 
 #[test]
 fn it_rejects_dangling_vaults_in_component() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
 
     //  Create with vault
@@ -84,7 +86,7 @@ fn it_rejects_dangling_vaults_in_component() {
 
 #[test]
 fn it_rejects_dangling_resources() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
 
     let reason = test.execute_expect_failure(
@@ -99,7 +101,7 @@ fn it_rejects_dangling_resources() {
 
 #[test]
 fn it_rejects_unknown_substate_ids() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
 
     let reason = test.execute_expect_failure(
@@ -121,7 +123,7 @@ fn it_rejects_unknown_substate_ids() {
 
 #[test]
 fn it_rejects_references_to_buckets_that_arent_in_scope() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
     let (account, owner_token, owner_key) = test.create_funded_account();
 
@@ -151,7 +153,7 @@ fn it_rejects_references_to_buckets_that_arent_in_scope() {
 
 #[test]
 fn it_rejects_double_ownership_of_vault() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
 
     let reason = test.execute_expect_failure(
@@ -166,7 +168,7 @@ fn it_rejects_double_ownership_of_vault() {
 
 #[test]
 fn it_prevents_access_to_vault_id_in_component_context() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
     let (account, _, _) = test.create_funded_account();
 
@@ -203,7 +205,7 @@ fn it_prevents_access_to_vault_id_in_component_context() {
 
 #[test]
 fn it_prevents_access_to_out_of_scope_component() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
     let (account, _, _) = test.create_funded_account();
 
@@ -234,7 +236,7 @@ fn it_prevents_access_to_out_of_scope_component() {
 
 #[test]
 fn it_disallows_calls_on_vaults_that_are_not_owned_by_current_component() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
     let (victim, _, _) = test.create_funded_account();
     let (attacker, _, _) = test.create_empty_account();
@@ -265,7 +267,7 @@ fn it_disallows_calls_on_vaults_that_are_not_owned_by_current_component() {
 
 #[test]
 fn it_disallows_vault_access_if_vault_is_not_owned() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
     let (victim, _, _) = test.create_funded_account();
 
@@ -289,7 +291,7 @@ fn it_disallows_vault_access_if_vault_is_not_owned() {
 
 #[test]
 fn it_disallows_minting_different_resource_type() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/resource_shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, RESOURCE_TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
     let (account, _, _) = test.create_empty_account();
 
@@ -324,7 +326,7 @@ fn it_disallows_minting_different_resource_type() {
 
 #[test]
 fn it_does_not_bring_non_owned_vault_id_into_scope() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
     let (account, _, _) = test.create_funded_account();
     let vault_id = {
@@ -349,7 +351,7 @@ fn it_does_not_bring_non_owned_vault_id_into_scope() {
 
 #[test]
 fn it_disallows_withdraws_from_vaults_outside_of_component_context() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let (account, _, _) = test.create_funded_account();
     let vault_id = {
         let store = test.read_only_state_store();
@@ -394,7 +396,7 @@ fn it_disallows_withdraws_from_vaults_outside_of_component_context() {
 
 #[test]
 fn it_disallows_withdraws_from_vaults_outside_of_owning_component() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let (account, _, _) = test.create_funded_account();
     let vault_id = {
         let store = test.read_only_state_store();
@@ -438,7 +440,7 @@ fn it_disallows_withdraws_from_vaults_outside_of_owning_component() {
 
 #[test]
 fn it_does_not_leak_a_callees_vaults_into_the_callers_scope() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
     let (victim, _, _) = test.create_funded_account();
     let (attacker, _, _) = test.create_empty_account();
@@ -469,7 +471,7 @@ fn it_does_not_leak_a_callees_vaults_into_the_callers_scope() {
 
 #[test]
 fn it_rejects_a_bucket_that_is_neither_consumed_nor_returned_by_a_call() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
 
     let result = test.execute_expect_success(
@@ -492,9 +494,28 @@ fn it_rejects_a_bucket_that_is_neither_consumed_nor_returned_by_a_call() {
     assert_reject_reason(reason, "were neither consumed nor returned by the call");
 }
 
+/// `Bucket::join` moves only the unlocked funds, so joining a bucket a proof has locked would destroy the locked
+/// portion while the proof still names it.
+#[test]
+fn it_rejects_joining_a_bucket_with_locked_funds() {
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
+    let template_addr = test.get_template_address(TEMPLATE_NAME);
+
+    let reason = test.execute_expect_failure(
+        test.transaction()
+            .call_function(template_addr, "with_fungible_vault", args![])
+            .put_workspace("component")
+            .call_method("component", "join_locked_bucket", args![])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+
+    assert_reject_reason(reason, "Cannot join bucket");
+}
+
 #[test]
 fn it_rejects_a_proof_that_is_neither_dropped_nor_returned_by_a_call() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
 
     let result = test.execute_expect_success(
@@ -519,7 +540,7 @@ fn it_rejects_a_proof_that_is_neither_dropped_nor_returned_by_a_call() {
 
 #[test]
 fn a_proof_outlives_the_authorization_taken_from_it() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
 
     let result = test.execute_expect_success(
@@ -551,7 +572,7 @@ fn a_proof_outlives_the_authorization_taken_from_it() {
 
 #[test]
 fn it_does_not_leak_a_callees_vaults_into_a_calling_components_scope() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
     let (victim, _, _) = test.create_funded_account();
     let (attacker_account, _, _) = test.create_empty_account();
@@ -593,7 +614,7 @@ fn it_does_not_leak_a_callees_vaults_into_a_calling_components_scope() {
 
 #[test]
 fn it_does_not_leak_a_callees_address_allocation_into_the_callers_scope() {
-    let mut test = TemplateTest::new(CRATE_PATH, ["tests/templates/shenanigans"]);
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
     let template_addr = test.get_template_address(TEMPLATE_NAME);
 
     let result = test.execute_expect_success(
@@ -616,4 +637,209 @@ fn it_does_not_leak_a_callees_address_allocation_into_the_callers_scope() {
     );
 
     assert_reject_reason(reason, RuntimeError::AddressAllocationNotInScope { id: 0 });
+}
+
+#[test]
+fn it_refuses_to_authorize_a_proof_the_frame_does_not_hold() {
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
+    let template_addr = test.get_template_address(TEMPLATE_NAME);
+
+    let result = test.execute_expect_success(
+        test.transaction()
+            .call_function(template_addr, "with_fungible_vault", args![])
+            .call_function(template_addr, "with_fungible_vault", args![])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+    let victim = result.finalize.execution_results[0]
+        .decode::<ComponentAddress>()
+        .unwrap();
+    let attacker = result.finalize.execution_results[1]
+        .decode::<ComponentAddress>()
+        .unwrap();
+
+    // The victim holds a proof across a call into the attacker, which is handed nothing and guesses the id.
+    let result = test.execute_expect_success(
+        test.transaction()
+            .call_method(victim, "hold_proof_and_call", args![
+                attacker,
+                "try_authorize_proof",
+                0u32
+            ])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+
+    assert_eq!(
+        result.finalize.execution_results[0].decode::<Amount>().unwrap(),
+        Amount::zero()
+    );
+}
+
+#[test]
+fn it_refuses_to_read_a_proof_the_frame_does_not_hold() {
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
+    let template_addr = test.get_template_address(TEMPLATE_NAME);
+
+    let result = test.execute_expect_success(
+        test.transaction()
+            .call_function(template_addr, "with_fungible_vault", args![])
+            .call_function(template_addr, "with_fungible_vault", args![])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+    let victim = result.finalize.execution_results[0]
+        .decode::<ComponentAddress>()
+        .unwrap();
+    let attacker = result.finalize.execution_results[1]
+        .decode::<ComponentAddress>()
+        .unwrap();
+
+    let reason = test.execute_expect_failure(
+        test.transaction()
+            .call_method(victim, "hold_proof_and_call", args![
+                attacker,
+                "read_proof_amount",
+                0u32
+            ])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+
+    assert_reject_reason(reason, "Encountered unknown or out of scope proof");
+}
+
+/// Giving up an authorization answers for any proof id, and leaves the proof with whoever holds it.
+///
+/// The victim gives up its own authorization when the pin's `ProofAccess` temporary drops, so by the time the
+/// attacker runs, proof 0 is in the victim's `proof_scope` and not its `auth_scope`. What this pins is therefore the
+/// holder's `proof_scope` entry surviving the attacker's call, and the call answering at all. The `auth_scope` half
+/// of the isolation is structural — `current_call_scope_mut` is `call_frames.last_mut()`, so a frame has no way to
+/// address another's scope — and observing it would need the victim to hold its guard across the call and then
+/// exercise something gated on the badge, there being no engine query for `auth_scope` membership.
+#[test]
+fn it_answers_a_drop_authorize_for_any_proof_id() {
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
+    let template_addr = test.get_template_address(TEMPLATE_NAME);
+
+    let result = test.execute_expect_success(
+        test.transaction()
+            .call_function(template_addr, "with_fungible_vault", args![])
+            .call_function(template_addr, "with_fungible_vault", args![])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+    let victim = result.finalize.execution_results[0]
+        .decode::<ComponentAddress>()
+        .unwrap();
+    let attacker = result.finalize.execution_results[1]
+        .decode::<ComponentAddress>()
+        .unwrap();
+
+    // Id 0 is live and held by the victim, and the victim's own `proof.drop()` after the call still finds it.
+    test.execute_expect_success(
+        test.transaction()
+            .call_method(victim, "hold_proof_and_call", args![
+                attacker,
+                "drop_authorize_proof",
+                0u32
+            ])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+
+    // An id with no proof at it answers the same, rather than aborting from `ProofAccess::drop`.
+    test.execute_expect_success(
+        test.transaction()
+            .call_method(attacker, "drop_authorize_proof", args![7u32])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+}
+
+/// A bucket, proof or address allocation is named by a counter that restarts each transaction, so one stored in a
+/// component reaches the ledger as an id that can only alias an unrelated object later. Component state is also
+/// handed to a resource auth hook as an argument, and an id in an argument is read as a capability the callee was
+/// lent — so a stored proof would lend the hook authority its caller never granted.
+///
+/// Two of these shapes have a second net: an unconsumed bucket or allocation is still live at the end of the
+/// transaction, so `validate_finalized` would reject them anyway. They are here for branch coverage. The two that
+/// escape everything else are the proof, whose object `drop_all_proofs_in_workspace` removes while the id stays in
+/// state, and the emptied bucket, which `validate_finalized` tolerates because it carries nothing.
+#[test]
+fn it_rejects_transient_values_in_component_state() {
+    let mut test = TemplateTest::new(CRATE_PATH, TEMPLATE_PATHS);
+    let template_addr = test.get_template_address(TEMPLATE_NAME);
+
+    let result = test.execute_expect_success(
+        test.transaction()
+            .call_function(template_addr, "with_fungible_vault", args![])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+    let holder = result.finalize.execution_results[0]
+        .decode::<ComponentAddress>()
+        .unwrap();
+
+    let reason = test.execute_expect_failure(
+        test.transaction()
+            .call_method(holder, "create_vault_proof", args![])
+            .put_last_instruction_output_on_workspace("proof")
+            .call_function(template_addr, "keep_proof_in_state", args![Workspace("proof")])
+            .drop_all_proofs_in_workspace()
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+    assert!(
+        reason.to_string().contains("Component state may not contain a proof"),
+        "keep_proof_in_state gave: {reason}"
+    );
+
+    let reason = test.execute_expect_failure(
+        test.transaction()
+            .call_function(template_addr, "mint_bucket", args![])
+            .put_last_instruction_output_on_workspace("bucket")
+            .call_function(template_addr, "keep_bucket_in_state", args![Workspace("bucket")])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+    assert!(
+        reason.to_string().contains("Component state may not contain a bucket"),
+        "keep_bucket_in_state gave: {reason}"
+    );
+
+    // An emptied bucket stays in scope and is tolerated at finalize, so this is the shape that reaches the ledger
+    // with nothing else objecting.
+    let reason = test.execute_expect_failure(
+        test.transaction()
+            .call_function(template_addr, "mint_bucket", args![])
+            .put_last_instruction_output_on_workspace("bucket")
+            .call_function(template_addr, "keep_emptied_bucket_in_state", args![Workspace(
+                "bucket"
+            )])
+            .build_and_seal(test.secret_key()),
+        vec![],
+    );
+    assert!(
+        reason.to_string().contains("Component state may not contain a bucket"),
+        "keep_emptied_bucket_in_state gave: {reason}"
+    );
+
+    for (function, kind) in [
+        ("keep_allocation_in_state", "component address allocation"),
+        ("keep_resource_allocation_in_state", "resource address allocation"),
+    ] {
+        let reason = test.execute_expect_failure(
+            test.transaction()
+                .call_function(template_addr, function, args![])
+                .build_and_seal(test.secret_key()),
+            vec![],
+        );
+        assert!(
+            reason
+                .to_string()
+                .contains(&format!("Component state may not contain a {kind}")),
+            "{function} gave: {reason}"
+        );
+    }
 }

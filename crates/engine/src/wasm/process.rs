@@ -50,12 +50,13 @@ use tari_template_lib::{
         SpendContextInvokeArg,
         VaultInvokeArg,
     },
-    types::engine_args::SignatureInvokeArg,
+    types::engine_args::IntrinsicInvokeArg,
 };
+use tari_wasmer_middlewares::metering::{MeteringPoints, get_remaining_points, set_remaining_points};
 use wasmer::{AsStoreMut, AsStoreRef, Function, FunctionEnv, FunctionEnvMut, Instance, Store, WasmPtr, imports};
-use wasmer_middlewares::metering::{MeteringPoints, get_remaining_points, set_remaining_points};
 
 use crate::{
+    abi_metrics,
     runtime::{ComputeAllowance, ComputeFunding, Runtime, RuntimeError},
     traits::Invokable,
     wasm::{
@@ -68,6 +69,8 @@ use crate::{
 };
 
 const LOG_TARGET: &str = "tari::ootle::engine::wasm::process";
+/// Log target for everything a template itself writes: its `tari_debug` output and its panics.
+const WASM_DEBUG_LOG_TARGET: &str = "tari::ootle::wasm";
 
 pub struct WasmProcess {
     module: LoadedWasmTemplate,
@@ -120,7 +123,9 @@ impl WasmProcess {
         }
         let len = u32::try_from(alloc_size).map_err(|_| WasmExecutionError::MemoryAllocationTooLarge)?;
 
+        let span = abi_metrics::Span::start();
         let ptr = self.alloc_checked(store, len)?;
+        abi_metrics::record_guest_alloc(alloc_size, span.finish());
         let mut fn_env = self.env_and_store(store);
         let (env, mut store) = fn_env.data_and_store_mut();
         let mut writer = env.memory_writer(&mut store, ptr)?;
@@ -216,6 +221,70 @@ impl WasmProcess {
         }
     }
 
+    /// Runs one invocation on the meter [`Invokable::invoke`] has installed, and reports how it
+    /// ended without charging for it — the caller charges every outcome alike.
+    ///
+    /// The metered span covers all three pieces of template code the engine drives for a call: the
+    /// `tari_alloc` that stages the `CallInfo`, the template function, and the `tari_free` of the
+    /// pointer the function returned. All of it is guest code running on the transaction's budget,
+    /// so all of it is charged to the transaction. The narrower window in which the template may
+    /// call the engine stays around the function alone.
+    fn run_metered(
+        &self,
+        store: &mut Store,
+        func: &MainFunction,
+        func_ident: u32,
+        args: &[tari_bor::Value],
+        call_info_size: usize,
+    ) -> Result<InvocationOutcome, WasmExecutionError> {
+        let span = abi_metrics::Span::start();
+        let call_info_ptr = self.with_alloc_and_mem_writer(store, call_info_size, |mem_writer| {
+            CallInfo::encode_v1_packed(mem_writer, func_ident, args)?;
+            Ok(())
+        })?;
+        abi_metrics::record_call_info_encode(call_info_size, span.finish());
+
+        // Call the contract entrypoint. Engine calls are admitted for exactly this window: the
+        // `tari_alloc` above and the `tari_free` below run template code too, but outside any
+        // invocation the engine could attribute effects to. Nothing may return early between the
+        // two calls below, or the window is left open over the free.
+        self.env_mut(store).enter_template_invocation();
+        let res = func.call(store, call_info_ptr.as_wasm_ptr(), call_info_ptr.len());
+        self.env_mut(store).exit_template_invocation();
+
+        let return_ptr = match res {
+            Ok(return_ptr) => return_ptr,
+            Err(err) => return Ok(InvocationOutcome::Trapped(err)),
+        };
+
+        // Read response from memory
+        // SAFETY: WasmProcess is not used concurrently
+        let span = abi_metrics::Span::start();
+        let mut return_bytes = 0usize;
+        let value = unsafe {
+            let mut fn_env = self.env_and_store(store);
+            let (env, mut store) = fn_env.data_and_store_mut();
+            env.with_memory_embedded_len(&mut store, return_ptr.offset(), |raw| {
+                return_bytes = raw.len();
+                // The returned value is bounded like the arguments passed the other way: it is
+                // decoded, validated and carried into the transaction result, all of it work the
+                // engine does outside the meter.
+                if raw.len() > limits::ENGINE_LIMITS.max_call_size {
+                    return Err(WasmExecutionError::CallSizeLimitExceeded {
+                        limit: limits::ENGINE_LIMITS.max_call_size,
+                    });
+                }
+                IndexedValue::from_raw(raw).map_err(WasmExecutionError::from)
+            })??
+        };
+        abi_metrics::record_return_decode(return_bytes, span.finish());
+
+        // Free allocated memory containing the result
+        self.free_checked(store, return_ptr)?;
+
+        Ok(InvocationOutcome::Returned(value))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn tari_engine_entrypoint(
         mut env: FunctionEnvMut<WasmEnv<Runtime>>,
@@ -281,78 +350,90 @@ impl WasmProcess {
         log::debug!(target: LOG_TARGET, "Engine call: {:?}", op);
 
         let result = match op {
-            EngineOp::EmitLog => Self::handle(&mut env, arg_ptr, arg_len, |state, arg: EmitLogArg| {
+            EngineOp::EmitLog => Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: EmitLogArg| {
                 state.interface_mut().emit_log(arg.level, arg.message)
             }),
-            EngineOp::ComponentInvoke => Self::handle(&mut env, arg_ptr, arg_len, |state, arg: ComponentInvokeArg| {
-                state
-                    .interface_mut()
-                    .component_invoke(arg.component_ref, arg.action, arg.args.into())
-            }),
-            EngineOp::ResourceInvoke => Self::handle(&mut env, arg_ptr, arg_len, |state, arg: ResourceInvokeArg| {
-                state
-                    .interface_mut()
-                    .resource_invoke(arg.resource_ref, arg.action, arg.args.into())
-            }),
-            EngineOp::VaultInvoke => Self::handle(&mut env, arg_ptr, arg_len, |state, arg: VaultInvokeArg| {
+            EngineOp::ComponentInvoke => {
+                Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: ComponentInvokeArg| {
+                    state
+                        .interface_mut()
+                        .component_invoke(arg.component_ref, arg.action, arg.args.into())
+                })
+            },
+            EngineOp::ResourceInvoke => {
+                Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: ResourceInvokeArg| {
+                    state
+                        .interface_mut()
+                        .resource_invoke(arg.resource_ref, arg.action, arg.args.into())
+                })
+            },
+            EngineOp::VaultInvoke => Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: VaultInvokeArg| {
                 state
                     .interface_mut()
                     .vault_invoke(arg.vault_ref, arg.action, arg.args.into())
             }),
-            EngineOp::BucketInvoke => Self::handle(&mut env, arg_ptr, arg_len, |state, arg: BucketInvokeArg| {
+            EngineOp::BucketInvoke => Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: BucketInvokeArg| {
                 state
                     .interface_mut()
                     .bucket_invoke(arg.bucket_ref, arg.action, arg.args.into())
             }),
             EngineOp::NonFungibleInvoke => {
-                Self::handle(&mut env, arg_ptr, arg_len, |state, arg: NonFungibleInvokeArg| {
+                Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: NonFungibleInvokeArg| {
                     state
                         .interface_mut()
                         .non_fungible_invoke(arg.address, arg.action, arg.args.into())
                 })
             },
-            EngineOp::GenerateUniqueId => Self::handle(&mut env, arg_ptr, arg_len, |state, _arg: ()| {
+            EngineOp::GenerateUniqueId => Self::handle(&mut env, op, arg_ptr, arg_len, |state, _arg: ()| {
                 state.interface_mut().generate_uuid()
             }),
-            EngineOp::ConsensusInvoke => Self::handle(&mut env, arg_ptr, arg_len, |state, arg: ConsensusInvokeArg| {
-                state.interface_mut().consensus_invoke(arg.action)
-            }),
+            EngineOp::ConsensusInvoke => {
+                Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: ConsensusInvokeArg| {
+                    state.interface_mut().consensus_invoke(arg.action)
+                })
+            },
             EngineOp::CallerContextInvoke => {
-                Self::handle(&mut env, arg_ptr, arg_len, |state, arg: CallerContextInvokeArg| {
+                Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: CallerContextInvokeArg| {
                     state.interface_mut().caller_context_invoke(arg.action, arg.args.into())
                 })
             },
-            EngineOp::AddressAllocationInvoke => {
-                Self::handle(&mut env, arg_ptr, arg_len, |state, arg: AddressAllocationInvokeArg| {
-                    state.interface_mut().allocate_address_invoke(arg)
-                })
-            },
+            EngineOp::AddressAllocationInvoke => Self::handle(
+                &mut env,
+                op,
+                arg_ptr,
+                arg_len,
+                |state, arg: AddressAllocationInvokeArg| state.interface_mut().allocate_address_invoke(arg),
+            ),
             EngineOp::GenerateRandomInvoke => {
-                Self::handle(&mut env, arg_ptr, arg_len, |state, arg: GenerateRandomInvokeArg| {
+                Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: GenerateRandomInvokeArg| {
                     state.interface_mut().generate_random_invoke(arg.action)
                 })
             },
-            EngineOp::EmitEvent => Self::handle(&mut env, arg_ptr, arg_len, |state, arg: EmitEventArg| {
+            EngineOp::EmitEvent => Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: EmitEventArg| {
                 state.interface_mut().emit_event(arg.topic, arg.payload)
             }),
-            EngineOp::CallInvoke => Self::handle(&mut env, arg_ptr, arg_len, |state, arg: CallInvokeArg| {
+            EngineOp::CallInvoke => Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: CallInvokeArg| {
                 state.interface_mut().call_invoke(arg.action, arg.args.into())
             }),
-            EngineOp::ProofInvoke => Self::handle(&mut env, arg_ptr, arg_len, |state, arg: ProofInvokeArg| {
+            EngineOp::ProofInvoke => Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: ProofInvokeArg| {
                 state
                     .interface_mut()
                     .proof_invoke(arg.proof_ref, arg.action, arg.args.into())
             }),
-            EngineOp::BuiltinTemplateInvoke => {
-                Self::handle(&mut env, arg_ptr, arg_len, |state, arg: BuiltinTemplateInvokeArg| {
-                    state.interface_mut().builtin_template_invoke(arg.action)
+            EngineOp::BuiltinTemplateInvoke => Self::handle(
+                &mut env,
+                op,
+                arg_ptr,
+                arg_len,
+                |state, arg: BuiltinTemplateInvokeArg| state.interface_mut().builtin_template_invoke(arg.action),
+            ),
+            EngineOp::IntrinsicInvoke => {
+                Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: IntrinsicInvokeArg| {
+                    state.interface_mut().intrinsic_invoke(arg.intrinsic, arg.args.into())
                 })
             },
-            EngineOp::SignatureInvoke => Self::handle(&mut env, arg_ptr, arg_len, |state, arg: SignatureInvokeArg| {
-                state.interface_mut().signature_invoke(arg.action, arg.args.into())
-            }),
             EngineOp::SpendContextInvoke => {
-                Self::handle(&mut env, arg_ptr, arg_len, |state, arg: SpendContextInvokeArg| {
+                Self::handle(&mut env, op, arg_ptr, arg_len, |state, arg: SpendContextInvokeArg| {
                     state.interface_mut().spend_context_invoke(arg.action)
                 })
             },
@@ -369,6 +450,7 @@ impl WasmProcess {
 
     fn handle<T, U, E>(
         env: &mut FunctionEnvMut<WasmEnv<Runtime>>,
+        op: EngineOp,
         arg_ptr: WasmPtr<u8>,
         arg_len: u32,
         f: fn(&mut Runtime, T) -> Result<U, E>,
@@ -378,6 +460,12 @@ impl WasmProcess {
         U: tari_bor::Encode<()> + tari_bor::CborLen<()>,
         WasmExecutionError: From<E>,
     {
+        let mut sample = abi_metrics::OpSample {
+            arg_bytes: arg_len as usize,
+            ..Default::default()
+        };
+
+        let span = abi_metrics::Span::start();
         let decoded = {
             let (env_mut, mut store) = env.data_and_store_mut();
             // SAFETY: WasmProcess is not used concurrently and templates are not able to spawn threads
@@ -390,14 +478,29 @@ impl WasmProcess {
                 })
             }??
         };
+        sample.decode_ns = span.finish();
+
+        let span = abi_metrics::Span::start();
         let resp = f(env.data_mut().state_mut(), decoded)?;
-        let len = encoded_len(&resp)?;
+        sample.handler_ns = span.finish();
+
+        let span = abi_metrics::Span::start();
+        let len = encoded_len(&resp);
+        sample.encode_ns = span.finish();
+        sample.resp_bytes = len;
+
+        let span = abi_metrics::Span::start();
         let ptr = Self::alloc_response(env, len)?;
+        sample.alloc_ns = span.finish();
 
         // Encode response directly into the WASM memory. The WASM code is responsible for freeing it.
+        let span = abi_metrics::Span::start();
         let (env_mut, mut store) = env.data_and_store_mut();
         let mut writer = env_mut.memory_writer(&mut store, ptr)?;
         encode_into_writer(&resp, &mut writer)?;
+        sample.encode_ns += span.finish();
+
+        abi_metrics::record_engine_op(op, sample);
         Ok(ptr)
     }
 
@@ -470,13 +573,11 @@ impl Invokable<Store> for WasmProcess {
         }
 
         let func_ident = hash_function_name(&func_def.name);
+        let span = abi_metrics::Span::start();
         let mut counter = ByteCounter::new();
         CallInfo::encode_v1_packed(&mut counter, func_ident, args)?;
         let call_info_size = counter.get();
-        let call_info_ptr = self.with_alloc_and_mem_writer(store, call_info_size, |mem_writer| {
-            CallInfo::encode_v1_packed(mem_writer, func_ident, args)?;
-            Ok(())
-        })?;
+        abi_metrics::record_call_info_size_pass(call_info_size, span.finish());
 
         let MeteringAllowance {
             consumed,
@@ -490,13 +591,7 @@ impl Invokable<Store> for WasmProcess {
         self.env_mut(store)
             .begin_metered_invocation(self.instance.clone(), points_before);
 
-        // Call the contract entrypoint. Engine calls are admitted for exactly this window: the
-        // `tari_alloc` above and the `tari_free` below run template code too, but outside any
-        // invocation the engine could meter, charge or attribute effects to. Nothing may return
-        // early between the two calls below, or the window is left open over the free.
-        self.env_mut(store).enter_template_invocation();
-        let res = func.call(store, call_info_ptr.as_wasm_ptr(), call_info_ptr.len());
-        self.env_mut(store).exit_template_invocation();
+        let outcome = self.run_metered(store, &func, func_ident, args, call_info_size);
 
         let remaining_after_call = get_remaining_points(store, &self.instance);
         let exhausted = matches!(remaining_after_call, MeteringPoints::Exhausted);
@@ -525,19 +620,22 @@ impl Invokable<Store> for WasmProcess {
         // catches only a site that is later added without one.
         take_refused_engine_call(self.env_mut(store))?;
 
-        match res {
-            Ok(return_ptr) => {
-                // Read response from memory
-                // SAFETY: WasmProcess is not used concurrently
-                let value = unsafe {
-                    let mut fn_env = self.env_and_store(store);
-                    let (env, mut store) = fn_env.data_and_store_mut();
-                    env.with_memory_embedded_len(&mut store, return_ptr.offset(), IndexedValue::from_raw)??
-                };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            // The metered span reaches past the template function, so it can also run out of gas in
+            // the `tari_alloc` that stages the `CallInfo` or the `tari_free` that releases the
+            // return value. Those end the call as an engine-side error rather than a trap, and are
+            // reported against whatever authorized the compute all the same.
+            Err(err) => {
+                return Err(exhausted
+                    .then(|| compute_exceeded_error(binding_allowance, consumed, points_consumed))
+                    .flatten()
+                    .unwrap_or(err));
+            },
+        };
 
-                // Free allocated memory containing the result
-                self.free_checked(store, return_ptr)?;
-
+        match outcome {
+            InvocationOutcome::Returned(value) => {
                 self.env(store).state().interface().validate_return_value(&value)?;
                 self.env_mut(store)
                     .state_mut()
@@ -549,34 +647,52 @@ impl Invokable<Store> for WasmProcess {
                     return_type: func_def.output.clone(),
                 })
             },
-            Err(err) => {
+            InvocationOutcome::Trapped(err) => {
                 if let Some(message) = self.env_mut(store).take_last_panic_message() {
                     return Err(WasmExecutionError::Panic {
                         message: expand_panic_message(func_def, message),
                         runtime_error: err,
                     });
                 }
-                if exhausted {
-                    match binding_allowance.map(|allowance| (allowance.funding, allowance.points)) {
-                        Some((ComputeFunding::FeeIntentCredit, credit_points)) => {
-                            return Err(WasmExecutionError::FeeIntentComputeExceeded {
-                                consumed_points: consumed.saturating_add(points_consumed),
-                                credit_points,
-                            });
-                        },
-                        Some((ComputeFunding::Payment, _)) => {
-                            return Err(WasmExecutionError::InsufficientFeesForCompute {
-                                consumed_points: consumed.saturating_add(points_consumed),
-                            });
-                        },
-                        None => {},
-                    }
+                if exhausted && let Some(err) = compute_exceeded_error(binding_allowance, consumed, points_consumed) {
+                    return Err(err);
                 }
                 error!(target: LOG_TARGET, "Error calling function: {}", err);
                 Err(err.into())
             },
         }
     }
+}
+
+/// Reports an out-of-gas invocation against the compute that authorized it, when the authorized
+/// compute — rather than the per-transaction hard cap — is what bound the call. `None` where the
+/// hard cap bound it, which is a limit rather than an underpayment.
+fn compute_exceeded_error(
+    binding_allowance: Option<ComputeAllowance>,
+    consumed: u64,
+    points_consumed: u64,
+) -> Option<WasmExecutionError> {
+    let allowance = binding_allowance?;
+    let consumed_points = consumed.saturating_add(points_consumed);
+    match allowance.funding {
+        ComputeFunding::FeeIntentCredit => Some(WasmExecutionError::FeeIntentComputeExceeded {
+            consumed_points,
+            credit_points: allowance.points,
+        }),
+        ComputeFunding::Payment => Some(WasmExecutionError::InsufficientFeesForCompute { consumed_points }),
+    }
+}
+
+/// How a metered invocation ended. Both arms are charged before either is turned into a result.
+///
+/// One of these exists per invocation and is consumed where it is returned, so the returned value
+/// travels in it directly rather than through a box.
+#[allow(clippy::large_enum_variant)]
+enum InvocationOutcome {
+    Returned(IndexedValue),
+    /// The template function trapped. The wasmer error is kept so a panic the template recorded can
+    /// be reported with it.
+    Trapped(wasmer::RuntimeError),
 }
 
 /// What one invocation may spend on the Wasmer meter, and what bounds it.
@@ -602,20 +718,38 @@ fn take_refused_engine_call<T>(env: &mut WasmEnv<T>) -> Result<(), WasmExecution
     }
 }
 
+/// `tari_debug` is a template's only way to write to the validator's log. What it writes goes
+/// through `log` rather than straight to stderr, is bounded in size and in count, and — like an
+/// engine call — is answered only while a template function invocation is in flight.
 fn debug_handler<T: Send + 'static>(mut env: FunctionEnvMut<WasmEnv<T>>, arg_ptr: WasmPtr<u8>, arg_len: u32) {
-    const WASM_DEBUG_LOG_TARGET: &str = "tari::ootle::wasm";
     let (state, mut store) = env.data_and_store_mut();
+    if !state.is_in_template_invocation() ||
+        !log::log_enabled!(target: WASM_DEBUG_LOG_TARGET, log::Level::Debug) ||
+        !state.allow_debug_message()
+    {
+        return;
+    }
+
+    let len = arg_len.min(limits::ENGINE_LIMITS.max_log_size_bytes as u32);
 
     // SAFETY: WasmProcess is not used concurrently
     unsafe {
-        if let Err(err) = state.with_memory_slice(&mut store, arg_ptr, arg_len, |msg| {
-            eprintln!("DEBUG: {}", String::from_utf8_lossy(msg));
+        if let Err(err) = state.with_memory_slice(&mut store, arg_ptr, len, |msg| {
+            log::debug!(target: WASM_DEBUG_LOG_TARGET, "{}", String::from_utf8_lossy(msg));
         }) {
             log::error!(target: WASM_DEBUG_LOG_TARGET, "Failed to read from memory: {}", err);
         }
     }
 }
 
+/// Records the panic a template reports through `on_panic`, which `WasmProcess::invoke` uses to
+/// report the trap that follows it. Only a template function invocation may record one: the
+/// `tari_alloc`/`tari_free` the engine drives around a call are template code too, and a panic
+/// planted from there would be attributed to the next call that traps.
+///
+/// `Self::alloc_response` suspends that window while it writes an engine call's response through
+/// the template's `tari_alloc`, so a panic raised inside that allocation reaches the transaction as
+/// a plain runtime error with no message attached.
 fn on_panic_handler<T: Send + 'static>(
     mut env: FunctionEnvMut<WasmEnv<T>>,
     msg_ptr: WasmPtr<u8>,
@@ -623,12 +757,23 @@ fn on_panic_handler<T: Send + 'static>(
     line: i32,
     col: i32,
 ) {
-    const WASM_DEBUG_LOG_TARGET: &str = "tari::ootle::wasm";
     let (state, mut store) = env.data_and_store_mut();
+    if !state.is_in_template_invocation() {
+        return;
+    }
+
+    let Ok(msg_len) = u32::try_from(msg_len) else {
+        log::error!(
+            target: WASM_DEBUG_LOG_TARGET,
+            "📣 PANIC: ({}:{}) WASM template reported a negative panic message length ({})",
+            line, col, msg_len
+        );
+        return;
+    };
 
     // SAFETY: There is no way to call this function concurrently
     let panic_message = unsafe {
-        state.with_memory_slice(&mut store, msg_ptr, msg_len as u32, |msg_bytes| {
+        state.with_memory_slice(&mut store, msg_ptr, msg_len, |msg_bytes| {
             if msg_bytes.len() > limits::ENGINE_LIMITS.max_panic_message_size {
                 let Ok(msg) = str::from_utf8(msg_bytes) else {
                     error!(target: WASM_DEBUG_LOG_TARGET, "📣 PANIC: ({}:{}) <invalid utf8 message>", line, col);

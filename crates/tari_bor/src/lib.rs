@@ -12,6 +12,7 @@ use alloc::{format, vec::Vec};
 pub mod adapters;
 mod error;
 mod macros;
+mod raw;
 #[cfg(feature = "serde")]
 pub mod serde_codec;
 mod tag;
@@ -26,6 +27,7 @@ pub use byte_counter::ByteCounter;
 pub use error::BorError;
 pub use macros::__cbor_macro;
 pub use minicbor::{self, CborLen, Decode, Encode};
+pub use raw::RawCbor;
 #[cfg(feature = "serde")]
 pub use serde::{self, Deserialize, Serialize, de::DeserializeOwned};
 pub use tag::*;
@@ -91,15 +93,16 @@ where
 /// the type structure. The fallback path through [`ByteCounter`] is still available for
 /// types that haven't derived `CborLen` yet (see [`encoded_len_via_writer`]).
 ///
-/// The `Result` return type is preserved for API compatibility — this function cannot
-/// actually fail today.
-pub fn encoded_len<T: CborLen<()> + ?Sized>(val: &T) -> Result<usize, BorError> {
+/// Infallible: the length follows from the type structure, so there is nothing to fail and no
+/// failure is invented. That matters because callers size allocations from this — a stand-in value
+/// for "unknown length" is either small enough to truncate or large enough to abort.
+pub fn encoded_len<T: CborLen<()> + ?Sized>(val: &T) -> usize {
     encoded_len_with(val, &mut ())
 }
 
 /// Pre-calculate the encoded length in bytes via [`minicbor::CborLen`] using a user-provided context.
-pub fn encoded_len_with<C, T: CborLen<C> + ?Sized>(val: &T, ctx: &mut C) -> Result<usize, BorError> {
-    Ok(minicbor::len_with(val, ctx))
+pub fn encoded_len_with<C, T: CborLen<C> + ?Sized>(val: &T, ctx: &mut C) -> usize {
+    minicbor::len_with(val, ctx)
 }
 
 /// Pre-calculate the encoded length in bytes (unit context), returning an error if it exceeds `limit`.
