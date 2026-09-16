@@ -14,6 +14,10 @@ mod template {
         vault: Option<Vault>,
         vault_copy: Option<Vault>,
         vault_ref: Option<VaultId>,
+        proof: Option<Proof>,
+        bucket: Option<Bucket>,
+        allocation: Option<ComponentAddressAllocation>,
+        resource_allocation: Option<ResourceAddressAllocation>,
     }
 
     impl Shenanigans {
@@ -38,6 +42,58 @@ mod template {
             let vault = Vault::new_empty(STEALTH_TARI_RESOURCE_ADDRESS);
             Self {
                 vault: Some(vault),
+                ..Default::default()
+            }
+        }
+
+        pub fn mint_bucket() -> Bucket {
+            ResourceBuilder::public_fungible().initial_supply(1000u32)
+        }
+
+        /// Stores the caller's `Proof` in this component's state. The proof is the caller's, so this frame does not
+        /// owe it and the dangling-proof check at pop has nothing to say about it.
+        pub fn keep_proof_in_state(proof: Proof) -> Self {
+            Self {
+                proof: Some(proof),
+                ..Default::default()
+            }
+        }
+
+        /// Stores the caller's `Bucket` in this component's state rather than in a vault. Inherited like the proof
+        /// above, so the dangling-bucket check does not cover it either.
+        pub fn keep_bucket_in_state(bucket: Bucket) -> Self {
+            Self {
+                bucket: Some(bucket),
+                ..Default::default()
+            }
+        }
+
+        /// Empties the caller's bucket into a fresh one and keeps the emptied bucket in state. An empty bucket is
+        /// tolerated at finalize and stays in the frame's scope, so neither the dangling-bucket check nor the
+        /// in-scope check on the new state objects to the id being there.
+        pub fn keep_emptied_bucket_in_state(mut bucket: Bucket) -> Component<Self> {
+            let contents = bucket.take(bucket.amount());
+            Component::new(Self {
+                vault: Some(Vault::from_bucket(contents)),
+                bucket: Some(bucket),
+                ..Default::default()
+            })
+            .with_access_rules(AccessRules::allow_all())
+            .create()
+        }
+
+        /// Keeps an unconsumed resource address allocation in state.
+        pub fn keep_resource_allocation_in_state() -> Self {
+            Self {
+                resource_allocation: Some(CallerContext::allocate_resource_address()),
+                ..Default::default()
+            }
+        }
+
+        /// Stores an unconsumed address allocation in this component's state.
+        pub fn keep_allocation_in_state() -> Self {
+            Self {
+                allocation: Some(CallerContext::allocate_component_address(None)),
                 ..Default::default()
             }
         }

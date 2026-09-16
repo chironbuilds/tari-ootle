@@ -1362,6 +1362,33 @@ impl<TStore: StateReader> WorkingState<TStore> {
             }
         }
 
+        // A bucket, proof or address allocation is a capability the transaction holds, named by a counter that
+        // restarts at zero every transaction. Persisting one stores an id that can only ever alias an unrelated
+        // object of a later transaction — and component state is handed to a resource auth hook as an argument,
+        // where an id in it is read as a capability the hook was lent.
+        //
+        // `validate_finalized` rejects one of these left live at the end of a transaction, which covers the
+        // careless cases. It cannot see an id whose object is gone or empty by then: a proof dropped from the
+        // workspace, or a bucket emptied into another. Those are what this check carries.
+        if let Some(id) = next_state.bucket_ids().first() {
+            return Err(RuntimeError::transient_in_component_state("bucket", id));
+        }
+        if let Some(id) = next_state.proof_ids().first() {
+            return Err(RuntimeError::transient_in_component_state("proof", id));
+        }
+        if let Some(alloc) = next_state.component_address_allocations().first() {
+            return Err(RuntimeError::transient_in_component_state(
+                "component address allocation",
+                alloc.id(),
+            ));
+        }
+        if let Some(alloc) = next_state.resource_address_allocations().first() {
+            return Err(RuntimeError::transient_in_component_state(
+                "resource address allocation",
+                alloc.id(),
+            ));
+        }
+
         // Check that no vaults are duplicated
         let mut dup_check = HashSet::with_capacity(next_state.vault_ids().len());
         for vault_id in next_state.vault_ids() {
