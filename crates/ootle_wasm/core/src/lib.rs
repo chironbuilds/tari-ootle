@@ -3,6 +3,7 @@
 
 pub mod address;
 pub mod bor;
+pub mod confidential;
 pub mod error;
 pub mod hash;
 pub mod keys;

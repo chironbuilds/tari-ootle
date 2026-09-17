@@ -35,4 +35,6 @@ pub enum OotleWasmError {
     Stealth(String),
     #[error("Stealth transfer validation failed: {0}")]
     StealthValidation(String),
+    #[error("Confidential crypto error: {0}")]
+    Confidential(String),
 }

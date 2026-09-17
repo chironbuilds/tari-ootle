@@ -420,6 +420,40 @@ pub fn generate_extended_bullet_proof(witnesses_json: &str) -> Result<Vec<u8>, J
         .map_err(|e| JsError::new(&e.to_string()))
 }
 
+/// Builds a `ConfidentialWithdrawProof` for the Account template's `withdraw_confidential` /
+/// `join_confidential` methods, and returns it `tari_bor`-encoded -- ready to hex-encode and wrap
+/// as an instruction `Literal` arg exactly like `microTariLiteral`/`amountLiteral` do for simpler
+/// types. Unlike those, this is NOT re-encoded on the JS side: the bytes are already the encoding
+/// the chain itself decodes, produced by the same derive-generated `Encode` impl.
+///
+/// `inputs_json` is a JSON array of `{ value, mask }` for each confidential UTXO being spent — `"[]"`
+/// for a revealed-only withdrawal (depositing into the vault). `output_json` / `change_json` are each
+/// an optional JSON object (see `createStealthOutputWitness`'s `OutputWitnessJson` shape) — omit to
+/// skip that side. `*_revealed_amount` is the plaintext portion on each side; confidential and
+/// revealed amounts can be mixed on either side.
+///
+/// Throws if `inputs_json`/`output_json`/`change_json` don't parse, or if any mask isn't a valid
+/// 32-byte Ristretto scalar.
+#[wasm_bindgen(js_name = "createConfidentialWithdrawProofLiteral")]
+pub fn create_confidential_withdraw_proof_literal(
+    inputs_json: &str,
+    input_revealed_amount: u64,
+    output_json: Option<String>,
+    output_revealed_amount: u64,
+    change_json: Option<String>,
+    change_revealed_amount: u64,
+) -> Result<Vec<u8>, JsError> {
+    ootle_wasm_core::confidential::create_confidential_withdraw_proof_literal(
+        inputs_json,
+        input_revealed_amount,
+        output_json.as_deref(),
+        output_revealed_amount,
+        change_json.as_deref(),
+        change_revealed_amount,
+    )
+    .map_err(|e| JsError::new(&e.to_string()))
+}
+
 /// Sign the balance proof for a stealth transfer.
 ///
 /// `aggregated_input_mask` and `aggregated_output_mask` are the 32-byte sums of all input / output
