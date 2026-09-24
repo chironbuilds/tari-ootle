@@ -609,3 +609,36 @@ pub fn decrypt_elgamal_viewable_balance(
     )
     .map_err(|e| JsError::new(&e.to_string()))
 }
+
+/// Derive the stealth claim secret `s = H(p·R) + p` for claiming an L1 (minotari) burn, from the
+/// account secret `p` and the burn's sender offset public key `R`. The claim transaction must be
+/// sealed with this key.
+#[wasm_bindgen(js_name = "burnClaimStealthSecret")]
+pub fn burn_claim_stealth_secret(account_secret: &[u8], sender_offset_public_key: &[u8]) -> Result<Vec<u8>, JsError> {
+    ootle_wasm_core::stealth::burn_claim::burn_claim_stealth_secret(account_secret, sender_offset_public_key)
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Check an L1 burn's ownership proof against the stealth claim key derived from `stealth_secret`,
+/// exactly as a validator will. `false` means the claim would be rejected.
+///
+/// `network` is the network byte (0x00 = MainNet, 0x10 = LocalNet, 0x26 = Esmeralda, ...).
+#[wasm_bindgen(js_name = "validateBurnClaimOwnershipProof")]
+pub fn validate_burn_claim_ownership_proof(
+    network: u8,
+    ownership_nonce: &[u8],
+    ownership_signature: &[u8],
+    commitment: &[u8],
+    value: u64,
+    stealth_secret: &[u8],
+) -> Result<bool, JsError> {
+    ootle_wasm_core::stealth::burn_claim::validate_burn_claim_ownership_proof(
+        network,
+        ownership_nonce,
+        ownership_signature,
+        commitment,
+        value,
+        stealth_secret,
+    )
+    .map_err(|e| JsError::new(&e.to_string()))
+}

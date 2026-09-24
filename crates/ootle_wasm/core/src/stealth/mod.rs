@@ -7,6 +7,7 @@
 //! entirely client-side. The thin `#[wasm_bindgen]` bindings live in the sibling `ootle-wasm` crate.
 
 pub mod balance_proof;
+pub mod burn_claim;
 pub mod encrypted_data;
 pub mod inputs;
 pub mod kdfs;
